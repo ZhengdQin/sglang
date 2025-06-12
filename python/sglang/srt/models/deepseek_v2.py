@@ -60,7 +60,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, NpuDeepEPMoE, get_moe_impl_class
+from sglang.srt.layers.moe.ep_moe.layer import (
+    DeepEPMoE,
+    NpuDeepEPMoE,
+    get_moe_impl_class,
+)
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import should_use_flashinfer_trtllm_moe
 from sglang.srt.layers.quantization import deep_gemm_wrapper
@@ -88,7 +92,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -639,15 +643,16 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         pad_size = None
         forward_mode = forward_batch.forward_mode
-        if forward_mode.is_extend():
-            pad_size = (
-                forward_batch.seq_lens_sum // get_attention_tp_size() + 1
-            ) - hidden_states.size(0)
-        else:
-            pad_size = (
-                forward_batch.batch_size // get_attention_tp_size() + 1
-            ) - hidden_states.size(0)
-        hidden_states = F.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
+        if not global_server_args_dict["enable_torch_compile"]:
+            if forward_mode.is_extend():
+                pad_size = (
+                    forward_batch.seq_lens_sum // get_attention_tp_size() + 1
+                ) - hidden_states.size(0)
+            else:
+                pad_size = (
+                    forward_batch.batch_size // get_attention_tp_size() + 1
+                ) - hidden_states.size(0)
+            hidden_states = F.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
         shared_output = None
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
             # router_logits: (num_tokens, n_experts)
@@ -710,7 +715,7 @@ class DeepseekV2MoE(nn.Module):
                 expanded_row_idx=expanded_row_idx,
             )
 
-        if pad_size > 0:
+        if (not global_server_args_dict["enable_torch_compile"]) and pad_size > 0:
             final_hidden_states = final_hidden_states[:-pad_size, :]
 
         return final_hidden_states
@@ -744,7 +749,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
-            with get_global_expert_distribution_recorder().with_current_layer(
+            with get_global_expert_distribution_recorder(_is_npu).with_current_layer(
                 self.layer_id
             ):
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
@@ -775,7 +780,7 @@ class DeepseekV2MoE(nn.Module):
 
     def op_dispatch_b(self, state):
         if self.ep_size > 1:
-            with get_global_expert_distribution_recorder().with_current_layer(
+            with get_global_expert_distribution_recorder(_is_npu).with_current_layer(
                 self.layer_id
             ):
                 state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
@@ -2139,7 +2144,7 @@ class DeepseekV2Model(nn.Module):
             else total_num_layers
         )
         for i in range(normal_num_layers):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
+            with get_global_expert_distribution_recorder(_is_npu).with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions,
@@ -2263,6 +2268,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 

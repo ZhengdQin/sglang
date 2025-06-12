@@ -2228,8 +2228,8 @@ class Scheduler(
         }
 
         if not _is_cpu:
-            ret["memory_usage"]["cuda_graph"] = round(
-                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
+            ret["memory_usage"]["graph"] = round(
+                self.tp_worker.worker.model_runner.graph_mem_usage, 2
             )
 
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:

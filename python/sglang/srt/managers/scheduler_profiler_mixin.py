@@ -158,9 +158,9 @@ class SchedulerProfilerMixin:
 
             self.torch_profiler = torch_npu.profiler.profile(
                 activities=torchprof_activities,
-                with_stack=with_stack if with_stack is not None else True,
-                record_shapes=record_shapes if record_shapes is not None else False,
-                profile_memory=True,
+                with_stack=False,
+                record_shapes=False,
+                profile_memory=False,
                 experimental_config=experimental_config,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     self.torch_profiler_output_dir

@@ -1359,7 +1359,7 @@ async def benchmark(
         prompt=test_request.prompt,
         api_url=api_url,
         prompt_len=test_request.prompt_len,
-        output_len=min(test_request.output_len, 32),
+        output_len=min(test_request.output_len, 16),
         lora_name=lora_name,
         image_data=test_request.image_data,
         extra_request_body=extra_request_body,

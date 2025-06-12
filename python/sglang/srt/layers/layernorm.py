@@ -49,11 +49,10 @@ if _use_aiter:
     from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 elif _is_hip:
     from vllm._custom_ops import fused_add_rms_norm, rms_norm
+elif _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
-
-if is_npu():
-    import torch_npu
 
 
 class RMSNorm(CustomOp):

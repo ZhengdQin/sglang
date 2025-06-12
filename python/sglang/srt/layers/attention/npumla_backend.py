@@ -46,22 +46,18 @@ class NpuMLADecodeMetadata:
         seq_lens_list=None,
         forward_batch: ForwardBatch = None,
     ):
-        tp_size = get_attention_tp_size()
         self.npumla_metadata = npumla_metadata
         self.block_kv_indices = block_kv_indices
         self.seq_lens_list = seq_lens_list if seq_lens_list is not None else [1]
-        if forward_batch.is_extend_in_batch:
-            self.seq_lens_list_cumsum = np.cumsum(self.seq_lens_list).tolist()
+        self.seq_lens_list_cumsum = np.cumsum(self.seq_lens_list).tolist()
+        if (
+            forward_batch.is_extend_in_batch
+            or forward_batch.global_num_tokens_cpu is None
+        ):
+            tp_size = get_attention_tp_size()
             self.seq_lens_list_cumsum[-1] = (
                 (self.seq_lens_list_cumsum[-1] - 1) // tp_size + 1
             ) * tp_size
-        else:
-            pad_size = (
-                forward_batch.global_num_tokens_cpu[0]
-                - forward_batch.global_num_tokens_for_logprob_cpu[0]
-            )
-            self.seq_lens_list = self.seq_lens_list + pad_size * [0]
-            self.seq_lens_list_cumsum = np.cumsum(self.seq_lens_list).tolist()
 
 
 def create_npumla_kv_indices(
@@ -146,15 +142,14 @@ class NpuMLABackend(TorchNativeAttnBackend):
         self.q_indptr_decode = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=model_runner.device
         )
+        max_total_tokens = model_runner.server_args.max_total_tokens or MAX_SEQ_LEN
+        self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.input_ids.size(0)
         if forward_batch.forward_mode.is_decode_or_idle():
-            max_seqlen_pad = (
-                forward_batch.seq_lens.max().item() + PAGE_SIZE - 1
-            ) // PAGE_SIZE
             block_kv_indices = torch.full(
-                (bs, max_seqlen_pad),
+                (bs, self.max_seqlen_pad),
                 -1,
                 dtype=torch.int32,
                 device=forward_batch.seq_lens.device,
@@ -167,7 +162,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 None,
                 block_kv_indices,
                 self.req_to_token.stride(0),
-                max_seqlen_pad,
+                self.max_seqlen_pad,
             )
             self.forward_metadata = NpuMLADecodeMetadata(
                 None,
@@ -199,17 +194,18 @@ class NpuMLABackend(TorchNativeAttnBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInfo],
+        forward_batch: ForwardBatch,
     ):
-        max_seqlen_pad = (num_tokens // bs + PAGE_SIZE - 1) // PAGE_SIZE
         self.forward_metadata = NpuMLADecodeMetadata(
             None,
             torch.full(
-                (bs, max_seqlen_pad),
+                (bs, self.max_seqlen_pad),
                 0,
                 dtype=torch.int32,
                 device=seq_lens.device,
             ),
             [1] * bs,
+            forward_batch,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -226,7 +222,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
         pass
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 1024
+        return 1
 
     def forward_decode(
         self,

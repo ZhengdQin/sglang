@@ -75,6 +75,8 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 
 GLOBAL_SERVER_ARGS_KEYS = [
     "attention_backend",
+    "decode_attention_backend",
+    "prefill_attention_backend",
     "mm_attention_backend",
     "debug_tensor_dump_inject",
     "debug_tensor_dump_output_folder",
@@ -109,6 +111,7 @@ GLOBAL_SERVER_ARGS_KEYS = [
     "enable_multimodal",
     "enable_symm_mem",
     "quantization",
+    "enable_torch_compile",
 ]
 
 # Put some global args for easy access
