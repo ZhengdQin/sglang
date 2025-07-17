@@ -749,6 +749,7 @@ def select_experts(
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
+            correction_bias=correction_bias.to(router_logits.dtype),
             topk=top_k,
             renormalize=renormalize,
         )

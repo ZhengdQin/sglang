@@ -507,12 +507,22 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             return
 
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+        if _is_npu:
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data.squeeze(-1), requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data.squeeze(-1).to(torch.bfloat16),
+                requires_grad=False,
+            )
+        else:
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data, requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data, requires_grad=False
+            )
+
         if self.enable_weight_nz:
             layer.w13_weight = layer.w13_weight.npu()
             layer.w2_weight = layer.w2_weight.npu()
