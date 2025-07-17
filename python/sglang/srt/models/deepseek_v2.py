@@ -1429,6 +1429,20 @@ class DeepseekV2AttentionMLA(nn.Module):
                 torch.bfloat16,
             )
             attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif _is_npu:
+            attn_bmm_output = torch.empty(
+                (self.num_local_heads, attn_output.shape[0], self.v_head_dim),
+                dtype=attn_output.dtype,
+                device=attn_output.device,
+            )
+            torch.bmm(
+                attn_output.transpose(0, 1),
+                self.w_vc,
+                out=attn_bmm_output,
+            )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).reshape(
+                -1, self.num_local_heads * self.v_head_dim
+            )
         else:
             attn_bmm_output = torch.empty(
                 (attn_output.shape[0], self.num_local_heads * self.v_head_dim),

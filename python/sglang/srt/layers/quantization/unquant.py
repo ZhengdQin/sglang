@@ -19,6 +19,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    is_npu,
     set_weight_attrs,
     use_intel_amx_backend,
 )
@@ -33,12 +34,16 @@ has_triton_kernels = importlib.util.find_spec("triton_kernels") is not None
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter import ActivationType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+if _is_npu:
+    import torch_npu
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -103,8 +108,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        self.enable_weight_nz = _is_npu
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.enable_weight_nz:
+            layer.weight.data = torch_npu.npu_format_cast(
+                layer.weight.data.transpose(-1, -2).contiguous(), 29
+            )  # 29: NZ format
+            layer.weight.input_dim = 0
+            layer.weight.output_dim = 1
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["weight"])
 
@@ -116,11 +128,18 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if use_intel_amx_backend(layer):
-            return torch.ops.sgl_kernel.weight_packed_linear(
+            out = torch.ops.sgl_kernel.weight_packed_linear(
                 x, layer.weight, bias, True  # is_vnni
             )
-
-        return F.linear(x, layer.weight, bias)
+        elif _is_npu and self.enable_weight_nz:
+            origin_shape = x.size()
+            out = torch.matmul(x.view(-1, origin_shape[-1]), layer.weight.data)
+            if bias is not None:
+                out = out + bias
+            out = out.view((*origin_shape[:-1], -1))
+        else:
+            out = F.linear(x, layer.weight, bias)
+        return out
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):

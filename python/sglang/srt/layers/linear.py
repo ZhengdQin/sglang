@@ -39,6 +39,12 @@ if TYPE_CHECKING:
         QuantizeMethodBase,
     )
 
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
+
+    torch.npu.config.allow_internal_format = True
+
 logger = logging.getLogger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
