@@ -150,6 +150,7 @@ def _fused_topk_postprocess(
 def npu_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
     topk: int,
     renormalize: bool,
     n_routed_experts: int,
@@ -160,7 +161,7 @@ def npu_topk(
     topk_weight, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
         gating_output,
         k=topk,
-        bias=torch.zeros(n_routed_experts, device=gating_output.device, dtype=gating_output.dtype),
+        bias=correction_bias,
         k_group=topk_group,
         group_count=num_expert_group,
         group_select_mode=1,
@@ -551,6 +552,7 @@ def select_experts(
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
+            correction_bias=correction_bias,
             topk=top_k,
             renormalize=renormalize,
             topk_group=topk_group,

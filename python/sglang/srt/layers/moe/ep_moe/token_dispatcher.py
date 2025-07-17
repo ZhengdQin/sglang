@@ -934,7 +934,7 @@ class NpuDeepEPDispatcher:
     ) -> Tuple:
         _kwargs = {
             "expand_x": hidden_states,
-            "expert_ids": topk_ids.to(torch.int),
+            "expert_ids": topk_ids,
             "expand_idx": topk_idx,
             "expert_scales": topk_weights.to(torch.float32),
             "expert_shard_type": 0,

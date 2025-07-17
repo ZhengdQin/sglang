@@ -264,12 +264,22 @@ class W8A8Int8MoEMethod:
 
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data, requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data, requires_grad=False
-        )
+
+
+        if _is_npu:
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data.squeeze(-1), requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data.squeeze(-1).to(torch.bfloat16), requires_grad=False
+            )
+        else:
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data, requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data, requires_grad=False
+            )
 
     def apply(
         self,

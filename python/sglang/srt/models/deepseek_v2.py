@@ -213,6 +213,7 @@ class MoEGate(nn.Module):
         self,
         config,
         prefix: str = "",
+        predefined_zeros_npu: torch.Tensor = None
     ):
         super().__init__()
         self.weight = nn.Parameter(
@@ -223,7 +224,10 @@ class MoEGate(nn.Module):
                 torch.empty((config.n_routed_experts))
             )
         else:
-            self.e_score_correction_bias = None
+            if _is_npu:
+                self.e_score_correction_bias = predefined_zeros_npu
+            else:
+                self.e_score_correction_bias = None
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
 
@@ -260,6 +264,7 @@ class DeepseekV2MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        predefined_zeros_npu: torch.Tensor = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -287,7 +292,7 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix), predefined_zeros_npu=predefined_zeros_npu)
 
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
@@ -1822,6 +1827,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        predefined_zeros_npu: torch.Tensor = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1871,6 +1877,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
+                predefined_zeros_npu=predefined_zeros_npu,
             )
         else:
             if enable_moe_dense_fully_dp():
@@ -2033,6 +2040,10 @@ class DeepseekV2Model(nn.Module):
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        if _is_npu:
+            self.predefined_zeros_npu = torch.zeros(config.n_routed_experts, device=torch.device("npu"), dtype=torch.float32)
+        else:
+            self.predefined_zeros_npu = None
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -2041,6 +2052,7 @@ class DeepseekV2Model(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
+                    predefined_zeros_npu=self.predefined_zeros_npu,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
