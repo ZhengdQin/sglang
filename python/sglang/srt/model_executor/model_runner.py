@@ -1709,7 +1709,7 @@ class ModelRunner:
             self.device_graph_runner
             and self.device_graph_runner.can_run_graph(forward_batch)
         )
-
+        forward_batch.can_run_graph = can_run_graph
         if can_run_graph:
             with self.device_graph_runner.get_runner_context(
                 forward_batch, skip_attn_backend_init

@@ -459,6 +459,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         can_fuse_mlp_allreduce: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
         if not self._enable_deepep_moe:
             DUAL_STREAM_TOKEN_THRESHOLD = 1024
@@ -474,7 +475,9 @@ class DeepseekV2MoE(nn.Module):
                 return self.forward_normal(hidden_states, can_fuse_mlp_allreduce)
         else:
             if _is_npu:
-                return self.forward_deepep_npu(hidden_states, forward_batch)
+                return self.forward_deepep_npu(
+                    hidden_states, forward_batch, kwargs.get("next_attn_weights")
+                )
             return self.forward_deepep(hidden_states, forward_batch)
 
     def forward_normal_dual_stream(
@@ -641,7 +644,10 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward_deepep_npu(
-        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        next_attn_weights: Dict = None,
     ) -> torch.Tensor:
         pad_size = None
         forward_mode = forward_batch.forward_mode
@@ -657,6 +663,14 @@ class DeepseekV2MoE(nn.Module):
             hidden_states = F.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
         shared_output = None
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
+
+            if forward_batch.forward_mode.is_decode() and forward_batch.can_run_graph:
+                torch_npu.npu_prefetch(
+                    self.experts.w13_weight,
+                    hidden_states,
+                    self.experts.w13_weight.numel(),
+                    0,
+                )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
@@ -700,8 +714,33 @@ class DeepseekV2MoE(nn.Module):
             hidden_states=hidden_states,
             expert_tokens=expert_tokens,
             dynamic_scale=dynamic_scale,
+            can_run_graph=forward_batch.can_run_graph,
         )
         if self.ep_size > 1:
+            if (
+                forward_batch.can_run_graph
+                and forward_batch.forward_mode.is_decode()
+                and next_attn_weights is not None
+            ):
+                attn_prefetch_size = 96 * 1024 * 1024
+                torch_npu.npu_prefetch(
+                    next_attn_weights["fused_qkv_a_proj_with_mqa"],
+                    final_hidden_states,
+                    attn_prefetch_size,
+                    0,
+                )
+                torch_npu.npu_prefetch(
+                    next_attn_weights["q_b_proj"],
+                    final_hidden_states,
+                    attn_prefetch_size,
+                    0,
+                )
+                torch_npu.npu_prefetch(
+                    next_attn_weights["w_kc"],
+                    final_hidden_states,
+                    attn_prefetch_size,
+                    0,
+                )
             final_hidden_states = self.deepep_dispatcher._inners[
                 0
             ]._normal_dispatcher.combine(
@@ -2188,6 +2227,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
+        **kwargs,
     ) -> torch.Tensor:
 
         hidden_states, residual = self.layer_communicator.prepare_attn(
@@ -2211,7 +2251,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             and not self.is_nextn
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, can_fuse_mlp_allreduce)
+        hidden_states = self.mlp(
+            hidden_states, forward_batch, can_fuse_mlp_allreduce, **kwargs
+        )
 
         if can_fuse_mlp_allreduce:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -2361,12 +2403,29 @@ class DeepseekV2Model(nn.Module):
         for i in range(normal_num_layers):
             with get_global_expert_distribution_recorder(_is_npu).with_current_layer(i):
                 layer = self.layers[i]
+                if (
+                    _is_npu
+                    and i < total_num_layers - 1
+                    and i >= self.first_k_dense_replace
+                ):
+                    next_layer = self.layers[i + 1]
+                    kwargs = {
+                        "next_attn_weights": {
+                            "fused_qkv_a_proj_with_mqa": next_layer.self_attn.fused_qkv_a_proj_with_mqa.weight,
+                            "q_b_proj": next_layer.self_attn.q_b_proj.weight,
+                            "w_kc": next_layer.self_attn.w_kc,
+                        }
+                    }
+                else:
+                    kwargs = {}
+
                 hidden_states, residual = layer(
                     positions,
                     hidden_states,
                     forward_batch,
                     residual,
                     zero_allocator,
+                    **kwargs,
                 )
 
         if normal_num_layers != total_num_layers:
