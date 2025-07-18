@@ -92,6 +92,7 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": get_local_ip_by_remote(),
             "rank_port": self.rank_port,
             "engine_rank": self.kv_args.engine_rank,
+            "gpu_id": self.kv_args.gpu_id,
         }
 
         try:
@@ -348,7 +349,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
         engine_rank = int(data["engine_rank"])
-
+        gpu_id = int(data["gpu_id"])
         if self.tp_size is None:
             self.tp_size = tp_size
 
@@ -371,6 +372,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self.prefill_port_table[dp_group][tp_rank_in_dp_group] = {
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
+                "gpu_id": gpu_id,
             }
             logger.debug(
                 f"Register Prefill bootstrap: {engine_rank} with rank_ip: {rank_ip} and rank_port: {rank_port}"

@@ -94,6 +94,7 @@ class MetadataBuffers:
         custom_mem_pool: torch.cuda.MemPool = None,
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.buffer_size = size
         device = "cpu"
         if is_npu():
             # For ascend backend, output tokens are placed in the NPU and will be transferred by D2D channel.
@@ -154,6 +155,9 @@ class MetadataBuffers:
         ]
         return ptrs, data_lens, item_lens
 
+    def get_buffer_size(self):
+        return self.buffer_size
+
     def get_buf(self, idx: int):
         return (
             self.output_ids[idx],
@@ -204,6 +208,7 @@ class MetadataBuffers:
 class TransferBackend(Enum):
     MOONCAKE = "mooncake"
     NIXL = "nixl"
+    LLMDATADIST = "llm-datadist"
     ASCEND = "ascend"
     FAKE = "fake"
 
@@ -270,6 +275,25 @@ def get_kv_class(transfer_backend: TransferBackend, class_type: KVClassType):
             KVClassType.BOOTSTRAP_SERVER: NixlKVBootstrapServer,
         }
         return class_mapping.get(class_type)
+
+    elif transfer_backend == TransferBackend.LLMDATADIST:
+        from sglang.srt.disaggregation.base import KVArgs
+        from sglang.srt.disaggregation.datadist import (
+            DataDistKVManager,
+            DataDistKVSender,
+            DataDistKVReceiver,
+            DataDistKVBootstrapServer,
+        )
+
+        class_mapping = {
+            KVClassType.KVARGS: KVArgs,
+            KVClassType.MANAGER: DataDistKVManager,
+            KVClassType.SENDER: DataDistKVSender,
+            KVClassType.RECEIVER: DataDistKVReceiver,
+            KVClassType.BOOTSTRAP_SERVER: DataDistKVBootstrapServer,
+        }
+        return class_mapping.get(class_type)
+
     elif transfer_backend == TransferBackend.FAKE:
         from sglang.srt.disaggregation.base import KVArgs
         from sglang.srt.disaggregation.fake import FakeKVReceiver, FakeKVSender
