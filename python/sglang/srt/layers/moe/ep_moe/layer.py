@@ -765,6 +765,10 @@ class NpuDeepEPMoE(DeepEPMoE):
             tuning_config=[0],
             group_list_type=1,
         )[0]
+        if kwargs.get("can_run_graph", False):
+            torch_npu.npu_prefetch(
+                self.w2_weight, gateup_output, self.w2_weight.numel(), 0
+            )
 
         if self.activation == "silu":
             down_input, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
