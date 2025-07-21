@@ -7,18 +7,28 @@ import re
 import subprocess
 import threading
 from collections import defaultdict
-from typing import Optional, Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import llm_datadist
 import numpy as np
 import torch
 import zmq
-from llm_datadist import CacheDesc, BlocksCacheKey, Cache
-from llm_datadist import LLMDataDist, LLMRole, LLMConfig
+from llm_datadist import (
+    BlocksCacheKey,
+    Cache,
+    CacheDesc,
+    LLMConfig,
+    LLMDataDist,
+    LLMRole,
+)
 from numpy import typing as npt
 
-from sglang.srt.disaggregation.base import KVArgs, KVPoll, BaseKVSender
-from sglang.srt.disaggregation.common import CommonKVManager, CommonKVReceiver, CommonKVBootstrapServer
+from sglang.srt.disaggregation.base import BaseKVSender, KVArgs, KVPoll
+from sglang.srt.disaggregation.common import (
+    CommonKVBootstrapServer,
+    CommonKVManager,
+    CommonKVReceiver,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_by_remote
@@ -59,7 +69,7 @@ class TransferInfo:
             dst_kv_indices=np.frombuffer(msg[3], dtype=np.int32),
             dst_aux_index=int(msg[4].decode("ascii")),
             required_dst_info_num=int(msg[5].decode("ascii")),
-            cluster_id=int(msg[6].decode("ascii"))
+            cluster_id=int(msg[6].decode("ascii")),
         )
 
 
@@ -69,21 +79,21 @@ def get_device_info(device_id):
         shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        universal_newlines=True
+        universal_newlines=True,
     )
-    hccn_path = '/usr/local/Ascend/driver/tools/hccn_tool'
+    hccn_path = "/usr/local/Ascend/driver/tools/hccn_tool"
     if npu_info.returncode != 0 or not os.path.exists(hccn_path):
         raise RuntimeError("no npu-smi/hccn tools provided for NPU.")
-    device_infos = [line.split(' ') for line in npu_info.stdout.splitlines()]
+    device_infos = [line.split(" ") for line in npu_info.stdout.splitlines()]
     info = device_infos[device_id]
     # info: npuId, chipId, deviceId, deviceIp, super_device_id, super_pod_id
     device_ip_info = subprocess.run(
-        [hccn_path, '-i', f'{info[2]}', '-ip', '-g'],
+        [hccn_path, "-i", f"{info[2]}", "-ip", "-g"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        universal_newlines=True
+        universal_newlines=True,
     )
-    re_result = re.match(r'ipaddr:(.*)\n', device_ip_info.stdout)
+    re_result = re.match(r"ipaddr:(.*)\n", device_ip_info.stdout)
     if re_result is None:
         raise RuntimeError("Can't find npu ip")
     device_ip = re_result.group(1)
@@ -93,13 +103,13 @@ def get_device_info(device_id):
         shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        universal_newlines=True
+        universal_newlines=True,
     )
-    re_result = re.search(r'SDID *: (\d+)', pod_info.stdout)
+    re_result = re.search(r"SDID *: (\d+)", pod_info.stdout)
     if re_result is None:
         raise RuntimeError("Can't find super device id")
     super_device_id = re_result.group(1)
-    re_result = re.search(r'Super Pod ID *: (\d+)', pod_info.stdout)
+    re_result = re.search(r"Super Pod ID *: (\d+)", pod_info.stdout)
     if re_result is None:
         raise RuntimeError("Can't find super pod id")
     super_pod_id = re_result.group(1)
@@ -120,19 +130,19 @@ def generate_rank_table_a3(device_id):
                     {
                         "device_id": f"{device_info[2]}",
                         "super_device_id": f"{device_info[4]}",
-                        "device_ip": f"{device_info[3]}"
+                        "device_ip": f"{device_info[3]}",
                     }
-                ]
+                ],
             }
         ],
         "super_pod_list": [
             {
                 "super_pod_id": f"{device_info[5]}",
                 "server_list": [
-                    {"server_id": f"{get_local_ip_by_remote()}"}
-                ]
+                    {"server_id": f"{get_local_ip_by_remote()}"},
+                ],
             }
-        ]
+        ],
     }
     return json.dumps(rank_info), device_count
 
@@ -145,7 +155,7 @@ TORCH_DTYPE_TO_NPU_DTYPE = {
     torch.float32: llm_datadist.DataType.DT_FLOAT,
     torch.int8: llm_datadist.DataType.DT_INT8,
     torch.int64: llm_datadist.DataType.DT_INT64,
-    torch.int32: llm_datadist.DataType.DT_INT32
+    torch.int32: llm_datadist.DataType.DT_INT32,
 }
 
 
@@ -174,7 +184,9 @@ class DataDistKVManager(CommonKVManager):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.role = LLMRole.PROMPT
             # p侧监听，D侧link_clusters
-            llm_config.listen_ip_info = f"{self.local_host_ip}:{26000 + self.kv_args.gpu_id}"
+            llm_config.listen_ip_info = (
+                f"{self.local_host_ip}:{26000 + self.kv_args.gpu_id}"
+            )
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.role = LLMRole.DECODER
             self.cluster_id += self.world_size * ServerArgs.nnodes
@@ -192,13 +204,20 @@ class DataDistKVManager(CommonKVManager):
 
         self.server_socket = zmq.Context().socket(zmq.PULL)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.transfer_infos: Dict[int, Dict[int, TransferInfo]] = {}  # room到D侧传输信息的映射
+            self.transfer_infos: Dict[int, Dict[int, TransferInfo]] = (
+                {}
+            )  # room到D侧传输信息的映射
             # P侧创建zmq监听，接受D侧的握手信息
             self.start_prefill_thread()
             # 启动多线程异步传输kv_cache，用队列保证请求处理的顺序性
             queue_size = 12
             self.transfer_queues = [queue.Queue() for _ in range(queue_size)]
-            [threading.Thread(target=self.transfer_worker, args=[q], daemon=True).start() for q in self.transfer_queues]
+            [
+                threading.Thread(
+                    target=self.transfer_worker, args=[q], daemon=True
+                ).start()
+                for q in self.transfer_queues
+            ]
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # 用来接受prefill发送的完成状态
             self.need_response_num: Dict[int, int] = {}
@@ -212,7 +231,7 @@ class DataDistKVManager(CommonKVManager):
         cache_desc = CacheDesc(
             num_tensors=len(self.kv_args.kv_data_ptrs),
             shape=tuple(self.kv_args.kv_data_shape),
-            data_type=TORCH_DTYPE_TO_NPU_DTYPE[self.kv_args.kv_data_dtype]
+            data_type=TORCH_DTYPE_TO_NPU_DTYPE[self.kv_args.kv_data_dtype],
         )
         cache_addrs = self.kv_args.kv_data_ptrs
         cache_key = BlocksCacheKey(self.cluster_id, 0)
@@ -225,7 +244,7 @@ class DataDistKVManager(CommonKVManager):
         cache_desc = CacheDesc(
             num_tensors=1,
             shape=(self.kv_args.metadata_buffer_size, 16),
-            data_type=TORCH_DTYPE_TO_NPU_DTYPE[torch.int32]
+            data_type=TORCH_DTYPE_TO_NPU_DTYPE[torch.int32],
         )
         cache_addrs = [output_ids_addr]
         cache_key = BlocksCacheKey(self.cluster_id, 1)
@@ -256,7 +275,9 @@ class DataDistKVManager(CommonKVManager):
             cluster_list = []
             for bootstrap_info in bootstrap_infos:
                 cluster = llm_datadist.LLMClusterInfo()
-                cluster.append_remote_ip_info(bootstrap_info["rank_ip"], 26000 + bootstrap_info["gpu_id"])
+                cluster.append_remote_ip_info(
+                    bootstrap_info["rank_ip"], 26000 + bootstrap_info["gpu_id"]
+                )
                 cluster_list.append(cluster)
             ret, rets = self.llm_datadist.link_clusters(cluster_list, 20000)
             if ret != llm_datadist.LLMStatusCode.LLM_SUCCESS:
@@ -284,7 +305,9 @@ class DataDistKVManager(CommonKVManager):
                 cluster_id = int(waiting_req_bytes[6].decode("ascii"))
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
-                self.transfer_infos[room][cluster_id] = TransferInfo.from_zmq(waiting_req_bytes)
+                self.transfer_infos[room][cluster_id] = TransferInfo.from_zmq(
+                    waiting_req_bytes
+                )
                 # 多个D对应一个P场景，等待D全部握手，开始传输
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     logger.debug(f"{room=} is bootstrapped")
@@ -310,7 +333,9 @@ class DataDistKVManager(CommonKVManager):
 
         def decode_thread():
             while True:
-                bootstrap_room, status, prefill_rank = self.server_socket.recv_multipart()
+                bootstrap_room, status, prefill_rank = (
+                    self.server_socket.recv_multipart()
+                )
                 status = int(status.decode("ascii"))
                 bootstrap_room = int(bootstrap_room.decode("ascii"))
                 prefill_rank = int(prefill_rank.decode("ascii"))
@@ -319,7 +344,9 @@ class DataDistKVManager(CommonKVManager):
                     if bootstrap_room in self.request_status:
                         self.response_tracker[bootstrap_room].add(prefill_rank)
                         expected_response_num = self.need_response_num[bootstrap_room]
-                        arrived_response_num = len(self.response_tracker[bootstrap_room])
+                        arrived_response_num = len(
+                            self.response_tracker[bootstrap_room]
+                        )
                         if (
                             self.is_mla_backend
                             or arrived_response_num == expected_response_num
@@ -351,7 +378,7 @@ class DataDistKVManager(CommonKVManager):
                     prefill_kv_indices.tolist(),
                     chunked_dst_kv_indices.tolist(),
                     range(len(self.kv_args.kv_data_ptrs)),
-                    range(len(self.kv_args.kv_data_ptrs))
+                    range(len(self.kv_args.kv_data_ptrs)),
                 )
 
                 # Only the last chunk we need to send the aux data.
@@ -363,7 +390,7 @@ class DataDistKVManager(CommonKVManager):
                         [prefill_aux_index],
                         [req.dst_aux_index],
                         range(1),
-                        range(1)
+                        range(1),
                     )
             if is_last:
                 # 全部发送完成，同步状态到decoder
@@ -374,7 +401,7 @@ class DataDistKVManager(CommonKVManager):
                         req.dst_port,
                         req.room,
                         KVPoll.Success,
-                        self.kv_args.engine_rank
+                        self.kv_args.engine_rank,
                     )
                 del self.transfer_infos[bootstrap_room]
 
@@ -384,7 +411,7 @@ class DataDistKVManager(CommonKVManager):
         kv_indices: npt.NDArray[np.int32],
         index_slice: slice,
         is_last: bool,
-        aux_index: Optional[int] = None
+        aux_index: Optional[int] = None,
     ):
         assert bootstrap_room in self.transfer_infos
         queue_index = bootstrap_room % len(self.transfer_queues)
@@ -415,23 +442,29 @@ class DataDistKVReceiver(CommonKVReceiver):
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
         kv_mgr: DataDistKVManager = self.kv_mgr
-        kv_mgr.need_response_num[self.bootstrap_room] = len(self.bootstrap_infos)  # 记录D侧需要P侧响应的个数
+        kv_mgr.need_response_num[self.bootstrap_room] = len(
+            self.bootstrap_infos
+        )  # 记录D侧需要P侧响应的个数
         for bootstrap_info in self.bootstrap_infos:
-            prefill_server_url = f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+            prefill_server_url = (
+                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+            )
             is_dummy = bootstrap_info["is_dummy"]
             sock, lock = self._connect("tcp://" + prefill_server_url)
 
             with lock:
-                sock.send_multipart([
-                    GUARD,
-                    str(self.bootstrap_room).encode("ascii"),
-                    kv_mgr.local_host_ip.encode("ascii"),
-                    str(kv_mgr.rank_port).encode("ascii"),
-                    kv_indices.tobytes() if not is_dummy else b"",
-                    str(aux_index).encode("ascii"),
-                    str(self.required_dst_info_num).encode("ascii"),
-                    str(kv_mgr.cluster_id).encode("ascii"),
-                ])
+                sock.send_multipart(
+                    [
+                        GUARD,
+                        str(self.bootstrap_room).encode("ascii"),
+                        kv_mgr.local_host_ip.encode("ascii"),
+                        str(kv_mgr.rank_port).encode("ascii"),
+                        kv_indices.tobytes() if not is_dummy else b"",
+                        str(aux_index).encode("ascii"),
+                        str(self.required_dst_info_num).encode("ascii"),
+                        str(kv_mgr.cluster_id).encode("ascii"),
+                    ]
+                )
 
     def poll(self) -> KVPoll:
         return self.kv_mgr.check_status(self.bootstrap_room)
@@ -457,7 +490,7 @@ class DataDistKVSender(BaseKVSender):
         bootstrap_addr: str,
         bootstrap_room: int,
         dest_tp_ranks: List[int],
-        pp_rank: int
+        pp_rank: int,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
@@ -476,11 +509,7 @@ class DataDistKVSender(BaseKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
         self.kv_mgr.add_transfer_request(
-            self.bootstrap_room,
-            kv_indices,
-            index_slice,
-            is_last,
-            self.aux_index
+            self.bootstrap_room, kv_indices, index_slice, is_last, self.aux_index
         )
 
     def poll(self) -> KVPoll:
