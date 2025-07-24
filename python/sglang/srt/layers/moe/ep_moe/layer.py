@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -40,6 +41,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config, W8A8Int8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
@@ -82,6 +84,8 @@ if use_flashinfer_trtllm_moe:
     except ImportError:
         fi_fused_moe = None
         use_flashinfer_trtllm_moe = False
+if _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +249,15 @@ class EPMoE(FusedMoE):
             self.w13_weight_scale = None
             self.w2_weight_scale = None
             self.activation_scheme = quant_config.moe_activation_scheme
+        elif _is_npu:
+            self.quant_method: Optional[QuantizeMethodBase] = W8A8Int8MoEMethod(
+                quant_config
+            )
+            self.use_fp8_w8a8 = False
+            self.use_int8_w8a8 = isinstance(quant_config, W8A8Int8Config)
+            self.use_block_quant = False
+            self.block_shape = None
+            self.activation_scheme = None
         elif isinstance(quant_config, Fp8Config):
             self.quant_method: Optional[QuantizeMethodBase] = Fp8MoEMethod(quant_config)
             self.use_fp8_w8a8 = True
@@ -1406,8 +1419,127 @@ class FlashInferEPMoE(EPMoE):
         )
 
 
+class NpuDeepEPMoE(DeepEPMoE):
+    def __init__(
+        self,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        layer_id: int,
+        params_dtype: Optional[torch.dtype] = None,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        num_fused_shared_experts: int = 0,
+        topk_group: Optional[int] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
+        prefix: str = "",
+        correction_bias: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        activation: str = "silu",
+        routed_scaling_factor: Optional[float] = None,
+        deepep_mode: DeepEPMode = DeepEPMode.normal,
+    ):
+        super().__init__(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            layer_id=layer_id,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            tp_size=tp_size,
+            prefix=prefix,
+            activation=activation,
+            routed_scaling_factor=routed_scaling_factor,
+            deepep_mode=deepep_mode,
+        )
+        self.grouped_gemm_runner = GroupedGemmRunner(
+            "npu",
+            use_flashinfer=False,
+        )
+
+        self.quant_scale = torch.nn.Parameter(
+            torch.ones(
+                size=(self.num_local_experts, self.w2_weight.size(-1)),
+                dtype=torch.float,
+            )
+        )  # smooth scale, now dpsk use smooth_scale == 1
+
+        assert self.quant_method is not None
+        assert self.use_int8_w8a8, (
+            "NpuDeepEPMoE requires an int8_w8a8 model;"
+            "alternatively, you can disable NpuDeepEPMoE by removing arg: --enable-deepep-moe."
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        expert_tokens=None,
+        dynamic_scale=None,
+        **kwargs,
+    ):
+        hidden_size = hidden_states.size(-1)
+
+        if dynamic_scale is not None and dynamic_scale.dim() > 1:
+            dynamic_scale = dynamic_scale.reshape(-1)
+            hidden_states = hidden_states.view(-1, hidden_size)
+
+        # GroupGemm-0
+        gateup_output = torch_npu.npu_grouped_matmul(
+            [hidden_states],
+            [self.w13_weight],
+            group_list=expert_tokens,
+            split_item=3,
+            group_type=0,
+            scale=None,
+            per_token_scale=None,
+            output_dtype=torch.int32,
+            tuning_config=[0],
+            group_list_type=1,
+        )[0]
+
+        if self.activation == "silu":
+            down_input, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
+                gateup_output,
+                weight_scale=self.w13_weight_scale.squeeze(-1),
+                activation_scale=dynamic_scale,
+                quant_scale=self.quant_scale,
+                group_index=expert_tokens,
+                activate_left=True,
+                quant_mode=1,
+            )
+        else:
+            raise ValueError(f"Unsupported activation: {self.activation=}")
+
+        del gateup_output
+
+        if dynamic_scale is not None and dynamic_scale.dim() > 1:
+            inter_size = down_input.size(-1)
+            dynamic_scale = dynamic_scale.reshape(-1)
+            down_input = down_input.view(-1, inter_size)
+
+        # GroupGemm-1
+        down_output = torch_npu.npu_grouped_matmul(
+            [down_input],
+            [self.w2_weight],
+            group_list=expert_tokens,
+            split_item=3,
+            group_type=0,
+            scale=[self.w2_weight_scale.squeeze(-1).to(torch.bfloat16)],
+            per_token_scale=[dynamic_scale],
+            output_dtype=torch.bfloat16,
+            tuning_config=[0],
+            group_list_type=1,
+        )[0]
+        return down_output
+
+
 def get_moe_impl_class():
     if global_server_args_dict["enable_deepep_moe"]:
+        if _is_npu:
+            return NpuDeepEPMoE
         return DeepEPMoE
     if global_server_args_dict["enable_flashinfer_cutlass_moe"]:
         # Must come before EPMoE because FusedMoE also supports enable_ep_moe
