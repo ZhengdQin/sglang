@@ -156,6 +156,7 @@ suites = {
     ],
     "per-commit-npu": [
         TestFile("test_ascend_attention_backend.py", 400),
+        TestFile("test_npu_mla_backend.py", 2000),
     ],
     "per-commit-2-gpu": [
         TestFile("models/lora/test_lora_tp.py", 116),
