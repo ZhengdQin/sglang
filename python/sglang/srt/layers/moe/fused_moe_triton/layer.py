@@ -29,11 +29,18 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import narrow_padded_param_and_loaded_weight
-from sglang.srt.utils import cpu_has_amx_support, get_bool_env_var, is_cpu, is_hip
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_hip,
+    is_npu,
+)
 
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
