@@ -475,6 +475,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
+
         alloc_extend_kernel[(bs,)](
             prefix_lens,
             seq_lens,
@@ -521,6 +522,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         bs = len(seq_lens)
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+
         alloc_decode_kernel[(bs,)](
             seq_lens,
             last_loc,
