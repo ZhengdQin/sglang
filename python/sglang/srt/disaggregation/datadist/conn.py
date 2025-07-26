@@ -173,6 +173,9 @@ class DataDistKVManager(CommonKVManager):
         self.local_host_ip = get_local_ip_by_remote()
         # bootstrap_room到状态的映射
         self.request_status: Dict[int, int] = {}
+        self.args = args
+        self.server_args = server_args
+        self.is_mla_backend = is_mla_backend
         # 初始化datadist
         llm_config = LLMConfig()
         llm_config.device_id = self.device_id
@@ -228,9 +231,16 @@ class DataDistKVManager(CommonKVManager):
             self.link_clusters_dict = {}
 
     def register_buffer_to_engine(self):
+        buf_shape = self.kv_args.kv_data_shape
+        # mla_backend, buf_shape should be modified by page_size
+        if self.is_mla_backend:
+            dim0, dim2 = buf_shape[0], buf_shape[2]
+            buf_shape = torch.Size(
+                (dim0 // self.server_args.page_size, self.server_args.page_size, dim2)
+            )
         cache_desc = CacheDesc(
             num_tensors=len(self.kv_args.kv_data_ptrs),
-            shape=tuple(self.kv_args.kv_data_shape),
+            shape=tuple(buf_shape),
             data_type=TORCH_DTYPE_TO_NPU_DTYPE[self.kv_args.kv_data_dtype],
         )
         cache_addrs = self.kv_args.kv_data_ptrs
@@ -379,6 +389,7 @@ class DataDistKVManager(CommonKVManager):
                     chunked_dst_kv_indices.tolist(),
                     range(len(self.kv_args.kv_data_ptrs)),
                     range(len(self.kv_args.kv_data_ptrs)),
+                    1,
                 )
 
                 # Only the last chunk we need to send the aux data.
@@ -391,6 +402,7 @@ class DataDistKVManager(CommonKVManager):
                         [req.dst_aux_index],
                         range(1),
                         range(1),
+                        1,
                     )
             if is_last:
                 # 全部发送完成，同步状态到decoder
