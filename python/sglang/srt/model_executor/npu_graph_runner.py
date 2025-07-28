@@ -221,10 +221,11 @@ class NpuGraphRunner(DeviceRunnerBase):
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
 
-        forward_batch.attn_backend.init_forward_metadata(forward_batch)
-        torch._dynamo.mark_static(
-            forward_batch.attn_backend.forward_metadata.block_kv_indices
-        )
+        if not skip_attn_backend_init:
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
+            torch._dynamo.mark_static(
+                forward_batch.attn_backend.forward_metadata.block_kv_indices
+            )
         yield runner_fn
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
