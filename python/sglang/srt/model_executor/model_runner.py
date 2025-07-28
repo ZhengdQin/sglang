@@ -226,6 +226,13 @@ class ModelRunner:
                 "deepep_mode": DeepEPMode(server_args.deepep_mode),
             }
         )
+        global_server_args_dict.update(
+            {
+                "npu_use_rope_cache": _is_npu
+                and global_server_args_dict["attention_backend"] == "npumla"
+                and self.use_mla_backend
+            }
+        )
 
         # CPU offload
         set_cpu_offload_max_bytes(int(server_args.cpu_offload_gb * 1024**3))
@@ -242,8 +249,11 @@ class ModelRunner:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # Create forward stream for overlap and use it for npu graph warmup
-        self.forward_stream = torch.get_device_module(self.device).Stream() \
-            if enable_overlap else torch.get_device_module(self.device).current_stream()
+        self.forward_stream = (
+            torch.get_device_module(self.device).Stream()
+            if enable_overlap
+            else torch.get_device_module(self.device).current_stream()
+        )
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
@@ -1226,6 +1236,7 @@ class ModelRunner:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
+                enable_kv_cache_seperated=global_server_args_dict["npu_use_rope_cache"],
             )
         elif self.server_args.enable_double_sparsity:
             self.token_to_kv_pool = DoubleSparseTokenToKVPool(

@@ -319,7 +319,6 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
 
         if not skip_attn_backend_init:
             forward_batch.attn_backend.init_forward_metadata(forward_batch)
-
         yield runner_fn
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
