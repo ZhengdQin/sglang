@@ -35,7 +35,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils import is_cuda, is_flashinfer_available
+from sglang.srt.utils import is_cuda, is_flashinfer_available, is_npu
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
@@ -108,7 +108,7 @@ class LayerScatterModes:
         if context.is_layer_sparse:
             return (
                 ScatterMode.SCATTERED
-                if global_server_args_dict["enable_deepep_moe"]
+                if (not (is_npu() and global_server_args_dict["enable_torch_compile"])) and global_server_args_dict["enable_deepep_moe"]
                 else ScatterMode.FULL
             )
         else:
