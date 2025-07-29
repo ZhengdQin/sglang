@@ -185,20 +185,21 @@ class NpuGraphRunner(DeviceRunnerBase):
                 ):
                     kwargs["pp_proxy_tensors"] = forward_batch.pp_proxy_tensors
                 self.mark_static(forward_batch, kwargs.get("pp_proxy_tensors"))
-                logits_output_or_pp_proxy_tensors = (
-                    self.model_runner.model.compile_forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
+                with torch.no_grad():
+                    logits_output_or_pp_proxy_tensors = (
+                        self.model_runner.model.compile_forward(
+                            forward_batch.input_ids,
+                            forward_batch.positions,
+                            forward_batch,
+                            **kwargs,
+                        )
                     )
-                )
-                return logits_output_or_pp_proxy_tensors
+                    return logits_output_or_pp_proxy_tensors
 
-            for _ in range(2):
-                torch.npu.synchronize()
-                self.model_runner.tp_group.barrier()
-                run_once()
+            # for _ in range(2):
+            #     torch.npu.synchronize()
+            #     self.model_runner.tp_group.barrier()
+            #     run_once()
 
         return
 
@@ -209,14 +210,17 @@ class NpuGraphRunner(DeviceRunnerBase):
         def runner_fn(
             skip_attn_backend_init: bool, pp_proxy_tensors: Optional["PPProxyTensors"]
         ):
-            return self.model_runner.model.compile_forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            self.mark_static(forward_batch, pp_proxy_tensors)
+            with torch.no_grad():
+                return self.model_runner.model.compile_forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
 
         forward_batch.attn_backend.init_forward_metadata(forward_batch)
+        torch._dynamo.mark_static(forward_batch.attn_backend.forward_metadata.block_kv_indices)
         yield runner_fn
 
     def can_run_graph(self, forward_batch: "ForwardBatch") -> bool:
