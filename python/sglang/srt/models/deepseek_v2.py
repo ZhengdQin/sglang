@@ -61,8 +61,11 @@ from sglang.srt.layers.moe.ep_moe.layer import (
     NpuDeepEPMoE,
     get_moe_impl_class,
 )
-from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import TopK, npu_topk, select_experts
+from sglang.srt.layers.moe.ep_moe.token_dispatcher import (
+    DeepEPDispatcher,
+    NpuDeepEPDispatcher,
+)
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -283,7 +286,6 @@ class DeepseekV2MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.n_routed_experts = config.n_routed_experts
         self.num_fused_shared_experts = (
             0
             if global_server_args_dict["disable_shared_experts_fusion"]
@@ -398,6 +400,7 @@ class DeepseekV2MoE(nn.Module):
                 "n_routed_experts": config.n_routed_experts,
                 "num_experts_per_tok": config.num_experts_per_tok,
             }
+        MaybeTboDeepEPDispatcher = NpuDeepEPDispatcher
         else:
             self.dispatch_args = {}
 
@@ -654,23 +657,13 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             shared_output = self._forward_shared_experts(hidden_states)
-            topk_weights, topk_idx, _ = select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                top_k=self.top_k,
-                use_grouped_topk=False if self.n_routed_experts == 256 else True,
-                renormalize=self.renormalize,
-                topk_group=self.topk_group,
-                num_expert_group=self.num_expert_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                correction_bias=self.correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
+            topk_weights, topk_idx, _ = self.topk(
+                hidden_states,
+                router_logits,
                 num_token_non_padded=forward_batch.num_token_non_padded,
                 expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
                     layer_id=self.layer_id,
                 ),
-                custom_routing_function=npu_topk,  # npu customized top_k function
-                n_routed_experts=self.n_routed_experts,
             )
         else:
             topk_idx = torch.full(
@@ -2147,21 +2140,15 @@ class DeepseekV2Model(nn.Module):
             else total_num_layers
         )
         for i in range(normal_num_layers):
-            if _is_npu:
+            with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual, zero_allocator
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
                 )
-            else:
-                with get_global_expert_distribution_recorder().with_current_layer(i):
-                    layer = self.layers[i]
-                    hidden_states, residual = layer(
-                        positions,
-                        hidden_states,
-                        forward_batch,
-                        residual,
-                        zero_allocator,
-                    )
 
         if normal_num_layers != total_num_layers:
             hidden_states, residual = model_forward_maybe_tbo(
