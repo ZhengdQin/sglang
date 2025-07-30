@@ -1,7 +1,9 @@
 import logging
+from tokenize import group
 from typing import Callable, List, Optional, Tuple
 
 import torch
+from PIL.ImImagePlugin import split
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import (
@@ -39,7 +41,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEPMoEMethod
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8MoEMethod
+from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config, W8A8Int8MoEMethod
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import (
@@ -51,6 +53,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+
+from examples.frontend_language.usage.llava_video.srt_example_llava_v import split_into_chunks
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -73,7 +77,7 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
-class GroupedGemmRunner(CustomOp):
+class GroupedGemmRunner(torch.nn.Module):
     flashinfer_gemm_warpper = None
 
     def __init__(
@@ -99,7 +103,7 @@ class GroupedGemmRunner(CustomOp):
         cls.flashinfer_gemm_warpper = SegmentGEMMWrapper(workspace_buffer)
 
     # c = a * b
-    def forward_native(
+    def forward(
         self,
         a: torch.Tensor,
         b: torch.Tensor,
@@ -144,37 +148,6 @@ class GroupedGemmRunner(CustomOp):
                 use_per_token_if_dynamic=self.use_per_token_if_dynamic,
             )
         return c
-
-    def forward_npu(
-        self,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        c: torch.Tensor,
-        c_dtype: torch.dtype = None,
-        scale_a: torch.Tensor = None,
-        scale_b: torch.Tensor = None,
-        expert_tokens=None,
-        n_routed_experts_per_rank=0,
-    ):
-        world_size = get_tensor_model_parallel_world_size()
-        if world_size > 1 and n_routed_experts_per_rank >= 1:
-            mm1_mm3 = torch_npu.npu_grouped_matmul(
-                [a],
-                [b],
-                group_list=expert_tokens,
-                split_item=3,
-                group_type=0,
-                scale=[scale_b] if scale_b is not None else None,
-                per_token_scale=[scale_a] if scale_a is not None else None,
-                output_dtype=c_dtype,
-                tuning_config=[0],
-                group_list_type=1,
-            )[0]
-        else:
-            mm1_mm3 = torch.matmul(a, b)
-        return mm1_mm3
-
-    forward_cuda = forward_native
 
 
 class EPMoE(torch.nn.Module):
@@ -245,6 +218,7 @@ class EPMoE(torch.nn.Module):
                 quant_config
             )
             self.use_fp8_w8a8 = False
+            self.use_int8_w8a8 = isinstance(quant_config, W8A8Int8Config)
             self.use_block_quant = False
             self.block_shape = None
             self.activation_scheme = None
@@ -1403,11 +1377,6 @@ class NpuDeepEPMoE(DeepEPMoE):
         n_routed_experts = num_experts - num_fused_shared_experts
         self.n_routed_experts_per_rank = n_routed_experts // self.tp_size
 
-        self.grouped_gemm_runner = GroupedGemmRunner(
-            "npu",
-            use_flashinfer=False,
-        )
-
         self.quant_scale = torch.nn.Parameter(
             torch.ones(
                 size=(self.n_routed_experts_per_rank, self.w2_weight.size(-1)),
@@ -1416,6 +1385,10 @@ class NpuDeepEPMoE(DeepEPMoE):
         )  # smooth scale, now dpsk use smooth_scale == 1
 
         assert self.quant_method is not None
+        assert self.use_int8_w8a8, (
+            "NpuDeepEPMoE requires an int8_w8a8 model;"
+            "alternatively, you can disable NpuDeepEPMoe by removing arg: --enable-deepep-moe."
+        )
 
     def forward(
         self,
@@ -1431,16 +1404,18 @@ class NpuDeepEPMoE(DeepEPMoE):
             hidden_states = hidden_states.view(-1, hidden_size)
 
         # GroupGemm-0
-        gateup_output = self.grouped_gemm_runner(
-            a=hidden_states,
-            b=self.w13_weight,
-            c=None,
-            c_dtype=torch.int32,
-            scale_a=None,
-            scale_b=None,
-            n_routed_experts_per_rank=self.n_routed_experts_per_rank,
-            expert_tokens=expert_tokens,
-        )
+        gateup_output = torch_npu.npu_grouped_matmul(
+            [hidden_states],
+            [self.w13_weight],
+            group_list=expert_tokens,
+            split_item=3,
+            group_type=0,
+            scale=None,
+            per_token_scale=None,
+            output_dtype=torch.int32,
+            tuning_config=[0],
+            group_list_type=1,
+        )[0]
 
         if self.activation == "silu":
             down_input, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
@@ -1463,16 +1438,18 @@ class NpuDeepEPMoE(DeepEPMoE):
             down_input = down_input.view(-1, inter_size)
 
         # GroupGemm-1
-        down_output = self.grouped_gemm_runner(
-            a=down_input,
-            b=self.w2_weight,
-            c=None,
-            c_dtype=torch.bfloat16,
-            scale_a=dynamic_scale,
-            scale_b=self.w2_weight_scale.squeeze(-1).to(torch.bfloat16),
-            n_routed_experts_per_rank=self.n_routed_experts_per_rank,
-            expert_tokens=expert_tokens,
-        )
+        down_output = torch_npu.npu_grouped_matmul(
+            [down_input],
+            [self.w2_weight],
+            group_list=expert_tokens,
+            split_item=3,
+            group_type=0,
+            scale=[self.w2_weight_scale.squeeze(-1).to(torch.bfloat16)],
+            per_token_scale=[dynamic_scale],
+            output_dtype=torch.bfloat16,
+            tuning_config=[0],
+            group_list_type=1,
+        )[0]
         return down_output
 
 

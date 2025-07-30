@@ -2613,7 +2613,7 @@ class Scheduler(
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
         if activities is None:
-            activities = ["CPU", "GPU", "NPU"]
+            activities = ["CPU", "GPU" if not _is_npu else "NPU"]
 
         self.torch_profiler_output_dir = output_dir
         self.torch_profiler_with_stack = with_stack
@@ -2655,15 +2655,14 @@ class Scheduler(
         with_stack = self.torch_profiler_with_stack
         record_shapes = self.torch_profiler_record_shapes
 
+        activity_map = {
+            "CPU": torch.profiler.ProfilerActivity.CPU,
+            "GPU": torch.profiler.ProfilerActivity.CUDA,
+        }
         if _is_npu:
             activity_map = {
                 "CPU": torch_npu.profiler.ProfilerActivity.CPU,
                 "NPU": torch_npu.profiler.ProfilerActivity.NPU,
-            }
-        else:
-            activity_map = {
-                "CPU": torch.profiler.ProfilerActivity.CPU,
-                "GPU": torch.profiler.ProfilerActivity.CUDA,
             }
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
@@ -2709,7 +2708,6 @@ class Scheduler(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
-                profile_memory=False,
                 experimental_config=experimental_config,
                 on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
                     self.torch_profiler_output_dir
