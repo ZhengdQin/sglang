@@ -20,10 +20,6 @@ from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAIndicesUpdaterDecode,
 )
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
-from sglang.srt.layers.attention.utils import (
-    create_flashinfer_kv_indices,
-    create_flashmla_kv_indices,
-)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -68,81 +64,31 @@ class NpuMLADecodeMetadata:
             self.seq_lens_list_cumsum = np.cumsum(self.seq_lens_list).tolist()
 
 
-class NpuMLAIndicesUpdaterDecode:
-    def __init__(self, model_runner: ModelRunner, attn_backend: AttentionBackend):
-        # Parse Constants
-        self.num_local_heads = (
-            model_runner.model_config.num_attention_heads // get_attention_tp_size()
-        )
-        if "deepseek" in model_runner.model_config.hf_config.architectures[0].lower():
-            self.kv_lora_rank = model_runner.model_config.kv_lora_rank
-            self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
-            self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
-            self.scaling = model_runner.model_config.scaling
-        else:
-            self.kv_lora_rank = None
-        self.data_type = model_runner.dtype
-        self.attn_backend = attn_backend
+def create_npumla_kv_indices(
+    bs,
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    page_kernel_lens_ptr,
+    kv_start_idx,
+    kv_indices_ptr,
+    req_to_token_ptr_stride,
+    kv_indices_ptr_stride,
+    PAGED_SIZE=128,
+):
+    req_to_token_ptr = req_to_token_ptr.view(-1)
 
-        # Buffers and wrappers
-        self.kv_indptr = attn_backend.kv_indptr
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
-        self.q_indptr = attn_backend.q_indptr_decode
+    for pid in range(bs):
+        # find the req pool idx, this is for batch to token
+        req_pool_index = req_pool_indices_ptr[pid]
 
-    def update(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        init_metadata_replay: bool = False,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
-        **fast_decode_kwargs,
-    ):
-        return self.call_begin_forward(
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            self.q_indptr,
-            self.kv_indptr,
-            init_metadata_replay,
-            spec_info,
-            **fast_decode_kwargs,
-        )
+        kv_start = 0
+        kv_end = page_kernel_lens_ptr[pid]
+        num_pages = (kv_end - kv_start + PAGED_SIZE - 1) // PAGED_SIZE
 
-    def call_begin_forward(
-        self,
-        req_pool_indices: torch.Tensor,
-        paged_kernel_lens: torch.Tensor,
-        paged_kernel_lens_sum: int,
-        q_indptr: torch.Tensor,
-        kv_indptr: torch.Tensor,
-        init_metadata_replay: bool = False,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]] = None,
-        **fast_decode_kwargs,
-    ):
-        bs = len(req_pool_indices)
-        q_indptr = q_indptr[: bs + 1]
-        if spec_info is None:
-            kv_indices = (
-                torch.zeros(bs * MAX_SEQ_LEN, dtype=torch.int32, device="npu")
-                if not init_metadata_replay
-                else fast_decode_kwargs["kv_indices"]
-            )
-            paged_kernel_lens_new = paged_kernel_lens.clone()
-            paged_kernel_lens_new.fill_(MAX_SEQ_LEN)
-            kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens_new, dim=0)
-            kv_indptr = kv_indptr[: bs + 1]
-            create_flashinfer_kv_indices(
-                bs,
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.shape[1],
-            )
-            return kv_indices.reshape(bs, -1)
+        for i in range(num_pages):
+            req_to_token_ptr_start = req_pool_index * req_to_token_ptr_stride + kv_start
+            paged_offset = req_to_token_ptr_start + i * PAGED_SIZE
+            kv_indices_ptr[pid, i] = req_to_token_ptr[paged_offset] // PAGED_SIZE
 
 
 class NpuMLABackend(TorchNativeAttnBackend):
@@ -200,7 +146,6 @@ class NpuMLABackend(TorchNativeAttnBackend):
         self.q_indptr_decode = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=model_runner.device
         )
-        self.indices_updater_decode = NpuMLAIndicesUpdaterDecode(model_runner, self)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.input_ids.size(0)
@@ -214,7 +159,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 dtype=torch.int32,
                 device=forward_batch.seq_lens.device,
             )
-            create_flashmla_kv_indices(
+            create_npumla_kv_indices(
                 forward_batch.batch_size,
                 self.req_to_token,
                 forward_batch.req_pool_indices,

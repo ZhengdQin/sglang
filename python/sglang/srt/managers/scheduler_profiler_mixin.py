@@ -8,6 +8,11 @@ import torch
 
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +141,25 @@ class SchedulerProfilerMixin:
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
+            )
+            self.torch_profiler.start()
+            self.profile_in_progress = True
+        elif _is_npu:
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                record_op_args=False,
+            )
+
+            self.torch_profiler = torch_npu.profiler.profile(
+                activities=torchprof_activities,
+                with_stack=with_stack if with_stack is not None else True,
+                record_shapes=record_shapes if record_shapes is not None else False,
+                profile_memory=True,
+                experimental_config=experimental_config,
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    self.torch_profiler_output_dir
+                ),
             )
             self.torch_profiler.start()
             self.profile_in_progress = True

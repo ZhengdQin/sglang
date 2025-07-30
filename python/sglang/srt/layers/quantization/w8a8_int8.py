@@ -70,6 +70,35 @@ def npu_wrapper_rmsnorm_init(func):
     return init
 
 
+# func refers to RMSNorm.forward_oot
+def npu_wrapper_rmsnorm_forward(func):
+    def _rmsnorm_forward_oot(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not x.is_contiguous():
+            x = x.contiguous()
+        original_dtype = x.dtype
+        x = x.to(torch.float32)
+        if residual is not None:
+            x = x + residual.to(torch.float32)
+            residual = x.to(original_dtype)
+
+        x = (
+            torch_npu.npu_rms_norm(
+                x, self.weight.to(torch.float32), self.variance_epsilon
+            )[0]
+            + self.bias
+        )
+
+        if residual is None:
+            return x.to(original_dtype)
+        return x.to(original_dtype), residual
+
+    return _rmsnorm_forward_oot
+
+
 def npu_fused_experts(
     hidden_states: torch.Tensor,
     w13: torch.Tensor,
@@ -182,6 +211,11 @@ class W8A8Int8Config(QuantizationConfig):
                         "__init__",
                         [npu_wrapper_rmsnorm_init],
                     )
+                    apply_module_patch(
+                        "sglang.srt.layers.layernorm.RMSNorm",
+                        "forward_npu",
+                        [npu_wrapper_rmsnorm_forward],
+                    )
 
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
@@ -229,7 +263,11 @@ class W8A8Int8Config(QuantizationConfig):
                         proj_name, self.packed_modules_mapping[proj_name][0]
                     )
                 self.is_dynamic = (
-                    self.quant_description[prefix_in_quant_config + ".weight"]
+                    "quant_method" in self.quant_description
+                    and self.quant_description["quant_method"] == "compressed-tensors"
+                ) or (
+                    f"{prefix_in_quant_config}.weight" in self.quant_description
+                    and self.quant_description[prefix_in_quant_config + ".weight"]
                     == "W8A8_DYNAMIC"
                 )
                 if self.is_layer_skipped(prefix, self.packed_modules_mapping):
@@ -267,7 +305,8 @@ class W8A8Int8Config(QuantizationConfig):
             is_skipped = None
             for shard_prefix in shard_prefixes:
                 is_shard_skipped = (
-                    self.quant_description[shard_prefix + ".weight"] == "FLOAT"
+                    f"{shard_prefix}.weight" in self.quant_description
+                    and self.quant_description[shard_prefix + ".weight"] == "FLOAT"
                 )
 
                 if is_skipped is None:
@@ -279,7 +318,10 @@ class W8A8Int8Config(QuantizationConfig):
                         "to have the same precision."
                     )
         else:
-            is_skipped = self.quant_description[prefix + ".weight"] == "FLOAT"
+            is_skipped = (
+                f"{prefix}.weight" in self.quant_description
+                and self.quant_description[prefix + ".weight"] == "FLOAT"
+            )
 
         assert is_skipped is not None
         return is_skipped
@@ -344,7 +386,7 @@ class W8A8Int8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ):
-        if getattr(layer, "use_intel_amx_backend", False):
+        if use_intel_amx_backend(layer):
             return torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
                 x,
                 layer.weight,
