@@ -288,6 +288,9 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
 
+    # can run this batch in graph mode?
+    can_run_graph: bool = False
+
     @classmethod
     def init_new(
         cls,

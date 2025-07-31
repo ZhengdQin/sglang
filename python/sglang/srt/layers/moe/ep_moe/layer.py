@@ -1442,6 +1442,10 @@ class NpuDeepEPMoE(DeepEPMoE):
             n_routed_experts_per_rank=self.n_routed_experts_per_rank,
             expert_tokens=expert_tokens,
         )
+        if kwargs.get("can_run_graph", False):
+            torch_npu.npu_prefetch(
+                self.w2_weight, gateup_output, self.w2_weight.numel(), 0
+            )
 
         if self.activation == "silu":
             down_input, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
