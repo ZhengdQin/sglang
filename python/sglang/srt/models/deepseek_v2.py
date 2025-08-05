@@ -711,11 +711,17 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
         else:
-            topk_idx = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
+            topk_idx = torch.randint(
+                low=0,
+                high=256,
+                size=(hidden_states.size(0), self.top_k),
+                dtype=torch.int,
+                device=hidden_states.device,
             )
             topk_weights = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+                (hidden_states.size(0), self.top_k),
+                dtype=torch.float32,
+                device=hidden_states.device,
             )
 
         expert_tokens = None
