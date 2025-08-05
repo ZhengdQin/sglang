@@ -16,6 +16,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,8 @@ class DPPaddingMode(IntEnum):
         # we choose the mode that minimizes the communication cost
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
-        if sum_len * 2 > max_len * get_attention_dp_size():
+        if sum_len * 2 > max_len * get_attention_dp_size() or is_npu():
+            # TODO: is_npu is because NPU HCCL need data has the same size on each card, the bs needs to be divided by the world size
             return cls.MAX_LEN
         else:
             return cls.SUM_LEN
@@ -250,6 +252,17 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+def memcpy_npu(dst, src, dim, offset, sz, offset_src):
+    assert dim == 0, "dim != 0 unsupported"
+    if sz == 0:
+        return
+    if offset_src:
+        # get_tp_group().reduce_scatter_tensor(dst, src)
+        dst.copy_(src[offset : offset + sz])
+    else:
+        dst[offset : offset + sz].copy_(src[0:sz])
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -262,12 +275,21 @@ def _dp_gather_via_all_reduce(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
+    if (
+        local_tokens.shape[0] > 0
+        and (is_partial or get_attention_tp_rank() == 0)
+        and not is_npu()
+    ):
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
         memcpy_triton(
+            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+        )
+    elif is_npu():
+        # npu not support memcpy_triton
+        memcpy_npu(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
 
@@ -345,7 +367,7 @@ def dp_scatter(
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
-    if local_tokens.shape[0] > 0:
+    if local_tokens.shape[0] > 0 and not is_npu():
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
@@ -353,6 +375,12 @@ def dp_scatter(
         memcpy_triton(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
+    elif is_npu():
+        memcpy_npu(
+            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+        )
+    else:
+        raise NotImplementedError("dp_scatter not implemented")
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
