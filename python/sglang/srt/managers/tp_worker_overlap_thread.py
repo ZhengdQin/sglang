@@ -65,7 +65,7 @@ class TpModelWorkerClient:
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, dp_rank, nccl_port
+            server_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, dp_rank, nccl_port, enable_overlap=True
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -81,7 +81,7 @@ class TpModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = self.worker.model_runner.forward_stream
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
         )
