@@ -1722,7 +1722,7 @@ class ModelRunner:
                 forward_batch.post_forward_mlp_sync_batch(ret)
             return ret, can_run_graph
 
-        # For MLP sync
+        # For MLP sync, NPU needs padding before can_run_graph, so put this at the beginning
         if not _is_npu:
             if forward_batch.global_num_tokens_cpu is not None:
                 forward_batch.prepare_mlp_sync_batch(self)
