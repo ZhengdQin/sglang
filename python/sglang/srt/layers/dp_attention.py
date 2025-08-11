@@ -254,13 +254,20 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
 
 def memcpy_npu(dst, src, dim, offset, sz, offset_src):
     assert dim == 0, "dim != 0 unsupported"
+    assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
     if sz == 0:
         return
     if offset_src:
         # get_tp_group().reduce_scatter_tensor(dst, src)
-        dst.copy_(src[offset : offset + sz])
+        if dst.size(0) > sz:
+            dst[0:sz].copy_(src[offset : offset + sz])
+        else:
+            dst.copy_(src[offset : offset + dst.size(0)])
     else:
-        dst[offset : offset + sz].copy_(src[0:sz])
+        if src.size(0) < sz:
+            dst[offset : offset + src.size(0)].copy_(src)
+        else:
+            dst[offset : offset + sz].copy_(src[0:sz])
 
 
 def _dp_gather_via_all_reduce(

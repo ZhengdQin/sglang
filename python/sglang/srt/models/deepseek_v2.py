@@ -657,13 +657,9 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
         else:
-            topk_idx = torch.randint(
-                low=0,
-                high=256,
-                size=(hidden_states.size(0), self.top_k),
-                dtype=torch.int,
-                device=hidden_states.device,
-            )
+            topk_idx = torch.randperm(256, device=hidden_states.device)[
+                : hidden_states.size(0) * self.top_k
+            ].reshape(hidden_states.size(0), self.top_k)
             topk_weights = torch.empty(
                 (hidden_states.size(0), self.top_k),
                 dtype=torch.float32,

@@ -52,9 +52,7 @@ class NpuMLADecodeMetadata:
         self.seq_lens_list = seq_lens_list if seq_lens_list is not None else [1]
         if forward_batch.is_extend_in_batch:
             self.seq_lens_list_cumsum = np.cumsum(self.seq_lens_list).tolist()
-            self.seq_lens_list_cumsum[-1] = (
-                (self.seq_lens_list_cumsum[-1] - 1) // tp_size + 1
-            ) * tp_size
+            self.seq_lens_list_cumsum[-1] = forward_batch.input_ids.size(0)
         else:
             pad_size = (
                 forward_batch.global_num_tokens_cpu[0]
