@@ -400,6 +400,15 @@ class DeepseekV2MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
+        if _is_npu:
+            self.dispatch_args = {
+                "n_shared_experts": config.n_shared_experts,
+                "n_routed_experts": config.n_routed_experts,
+                "num_experts_per_tok": config.num_experts_per_tok,
+            }
+        else:
+            self.dispatch_args = {}
+
         if global_server_args_dict["moe_a2a_backend"].is_deepep():
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
@@ -427,6 +436,7 @@ class DeepseekV2MoE(nn.Module):
                 deepep_mode=global_server_args_dict["deepep_mode"],
                 async_finish=True,
                 return_recv_hook=True,
+                **self.dispatch_args,
             )
 
         self._enable_deepep_moe = global_server_args_dict["moe_a2a_backend"].is_deepep()
