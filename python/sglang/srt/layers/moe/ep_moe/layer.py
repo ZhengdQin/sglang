@@ -773,7 +773,7 @@ class NpuDeepEPMoE(DeepEPMoE):
         if self.activation == "silu":
             down_input, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
                 gateup_output,
-                weight_scale=self.w13_weight_scale.squeeze(-1),
+                weight_scale=self.w13_weight_scale,
                 activation_scale=dynamic_scale,
                 quant_scale=self.quant_scale,
                 group_index=expert_tokens,
