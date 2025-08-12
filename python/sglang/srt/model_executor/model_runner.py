@@ -168,6 +168,7 @@ class ModelRunner:
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        enable_overlap: bool = False,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -239,6 +240,10 @@ class ModelRunner:
         # Update deep gemm configure
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
+
+        # Create forward stream for overlap and use it for npu graph warmup
+        self.forward_stream = torch.get_device_module(self.device).Stream() \
+            if enable_overlap else torch.get_device_module(self.device).current_stream()
 
         # If it is a draft model, tp_group can be different
         self.initialize(min_per_gpu_memory)
@@ -1558,7 +1563,8 @@ class ModelRunner:
         logger.info(
             f"Compile graph with npu begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        self.device_graph_runner = NpuGraphRunner(self)
+        with torch.get_device_module(self.device).stream(self.forward_stream):
+            self.device_graph_runner = NpuGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(

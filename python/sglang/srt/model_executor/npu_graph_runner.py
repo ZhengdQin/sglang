@@ -18,6 +18,7 @@ from __future__ import annotations
 import bisect
 import inspect
 import os
+import types
 from contextlib import contextmanager
 from typing import (
     TYPE_CHECKING,
@@ -32,6 +33,7 @@ from typing import (
 
 import torch
 import tqdm
+from networkx.utils.backends import backends
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -67,6 +69,7 @@ class NpuGraphRunner(DeviceRunnerBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.enable_cache = os.getenv("ENABLE_TORCH_COMPILE_CACHE", "0") == "1"
         try:
             self.warm_up()
         except RuntimeError as e:
@@ -78,6 +81,90 @@ class NpuGraphRunner(DeviceRunnerBase):
                 "3. disable torch compile by not using --enable-torch-compile\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
+
+    def prepare_forward_batch(self, bs: int, num_tokens: int) -> ForwardBatch:
+        # Graph inputs
+        with torch.device(self.model_runner.device):
+            input_ids = torch.zeros((num_tokens,), dtype=torch.int64)
+            req_pool_indices = torch.zeros((bs,), dtype=torch.int64)
+            seq_lens = torch.full((bs,), self.seq_len_fill_value, dtype=torch.int64)
+            out_cache_loc = torch.zeros((num_tokens,), dtype=torch.int32)
+            positions = torch.zeros((num_tokens,), dtype=torch.int64)
+            gathered_buffer = None
+            if self.require_gathered_buffer:
+                gathered_buffer = torch.zeros(
+                    (
+                        num_tokens,
+                        self.model_runner.model_config.hidden_size,
+                    ),
+                    dtype=self.model_runner.dtype,
+                )
+            num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32)
+
+        if self.is_encoder_decoder:
+            encoder_lens = self.encoder_lens[:bs]
+        else:
+            encoder_lens = None
+        mrope_positions = None
+
+        # pipeline parallelism
+        if self.pp_size > 1:
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:num_tokens] for k, v in self.pp_proxy_tensors.items()}
+            )
+
+        if self.require_mlp_tp_gather:
+            global_num_tokens = torch.tensor(
+                [
+                    num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
+                    for i in range(self.dp_size)
+                ],
+                dtype=torch.int64,
+                device=input_ids.device,
+            )
+        elif self.require_attn_tp_gather:
+            global_num_tokens = torch.tensor([num_tokens], dtype=torch.int64, device=input_ids.device)
+        else:
+            global_num_tokens = None
+            gathered_buffer = None
+
+        spec_info = self.get_spec_info(num_tokens)
+        if self.capture_hidden_mode != CaptureHiddenMode.FULL:
+            self.capture_hidden_mode = (
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            )
+
+        forward_batch = ForwardBatch(
+            forward_mode=self.capture_forward_mode,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens.cpu(),
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=self.model_runner.attn_backend,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens.sum().item(),
+            encoder_lens=encoder_lens,
+            return_logprob=False,
+            positions=positions,
+            global_num_tokens_gpu=global_num_tokens,
+            gathered_buffer=gathered_buffer,
+            mrope_positions=mrope_positions,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=self.capture_hidden_mode,
+            num_token_non_padded=num_token_non_padded,
+            global_forward_mode=None,
+            mm_inputs=[None] * bs,
+            lora_ids=[None] * bs,
+            global_num_tokens_cpu=[num_tokens],
+            global_num_tokens_for_logprob_cpu=[num_tokens],
+            global_num_tokens_for_logprob_gpu=global_num_tokens.clone(),
+            can_run_graph=True,
+        )
+        return forward_batch
 
     def mark_static(
         self, forward_batch: ForwardBatch, pp_proxy_tensors: PPProxyTensors = None
@@ -106,6 +193,7 @@ class NpuGraphRunner(DeviceRunnerBase):
         mark_tensor_static(forward_batch.input_embeds)
         mark_tensor_static(forward_batch.out_cache_loc)
         mark_tensor_static(forward_batch.gathered_buffer)
+        mark_tensor_static(forward_batch.attn_backend.forward_metadata.block_kv_indices)
         try:
             mark_tensor_static(forward_batch.token_to_kv_pool.k_buffer, is_cache=True)
             mark_tensor_static(forward_batch.token_to_kv_pool.v_buffer, is_cache=True)
@@ -121,17 +209,29 @@ class NpuGraphRunner(DeviceRunnerBase):
             return
 
         rank0_log("Warming up npu graph")
-        self.model_runner.model.compile_forward = torch.compile(
-            torch.no_grad()(self.model_runner.model.forward),
-            fullgraph=True,
-            dynamic=True,
-            backend=get_compiler_backend(),
-        )
+        backend =  get_compiler_backend()
+        if not self.enable_cache:
+            self.model_runner.model.compile_forward = torch.compile(
+                torch.no_grad()(self.model_runner.model.forward),
+                fullgraph=True,
+                dynamic=True,
+                backend=backend,
+            )
+
         compile_range = (
             tqdm.tqdm(list(reversed(self.compile_bs)))
             if get_tensor_model_parallel_rank() == 0
             else reversed(self.compile_bs)
         )
+
+        def build_method(method_name):
+            method_code = f"""
+def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
+    return self.forward(input_ids, positions, forward_batch, **kwargs)
+"""
+            exec(method_code)
+            return locals()[method_name]
+
         for bs in compile_range:
             if get_tensor_model_parallel_rank() == 0:
                 avail_mem = get_available_gpu_memory(
@@ -144,31 +244,17 @@ class NpuGraphRunner(DeviceRunnerBase):
                 )
             num_tokens = bs * self.num_tokens_per_bs
             forward_batch = self.prepare_forward_batch(bs, num_tokens)
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
 
-            if (
-                get_device().startswith("npu")
-                and os.getenv("SGLANG_USE_DIM_GEARS", "0") == "1"
-            ):
+            if self.enable_cache:
                 import torchair
 
-                torchair.inference.set_dim_gears(
-                    forward_batch.input_ids, dim_gears={0: self.compile_bs}
-                )
-
-            if forward_batch.lora_ids is not None:
-                self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
-
-            # Attention backend
-            self.model_runner.attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.encoder_lens,
-                forward_batch.forward_mode,
-                forward_batch.spec_info,
-                forward_batch,
-            )
+                method_name = f'forward_{bs}bs'
+                compile_method_name = f'compile_forward_{bs}bs'
+                setattr(self.model_runner.model, method_name, types.MethodType(build_method(method_name),
+                                                                               self.model_runner.model))
+                setattr(self.model_runner.model, compile_method_name,
+                        torchair.inference.cache_compile(getattr(self.model_runner.model, method_name), backend=backend))
 
             # Run and capture
             def run_once():
@@ -187,9 +273,13 @@ class NpuGraphRunner(DeviceRunnerBase):
                 ):
                     kwargs["pp_proxy_tensors"] = forward_batch.pp_proxy_tensors
                 self.mark_static(forward_batch, kwargs.get("pp_proxy_tensors"))
+
+                compile_forward = getattr(self.model_runner.model, compile_method_name) if self.enable_cache \
+                    else self.model_runner.model.compile_forward
+
                 with torch.no_grad():
                     logits_output_or_pp_proxy_tensors = (
-                        self.model_runner.model.compile_forward(
+                        compile_forward(
                             forward_batch.input_ids,
                             forward_batch.positions,
                             forward_batch,
@@ -198,10 +288,10 @@ class NpuGraphRunner(DeviceRunnerBase):
                     )
                     return logits_output_or_pp_proxy_tensors
 
-            # for _ in range(2):
-            #     torch.npu.synchronize()
-            #     self.model_runner.tp_group.barrier()
-            #     run_once()
+            for _ in range(2):
+                torch.npu.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
 
         return
 
@@ -212,20 +302,24 @@ class NpuGraphRunner(DeviceRunnerBase):
         skip_attn_backend_init: bool,
     ) -> Generator[Callable[[bool, PPProxyTensors | None], Any], Any, None]:
         def runner_fn(pp_proxy_tensors: Optional[PPProxyTensors]):
-            self.mark_static(forward_batch, pp_proxy_tensors)
+            kwargs = {}
+            if pp_proxy_tensors is not None:
+                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
+            compile_method_name = f'compile_forward_{forward_batch.input_ids.size(0)}bs'
+            compile_forward = getattr(self.model_runner.model, compile_method_name) if self.enable_cache \
+                else self.model_runner.model.compile_forward
             with torch.no_grad():
-                return self.model_runner.model.compile_forward(
+                return compile_forward(
                     forward_batch.input_ids,
                     forward_batch.positions,
                     forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
+                    **kwargs,
                 )
 
         if not skip_attn_backend_init:
             forward_batch.attn_backend.init_forward_metadata(forward_batch)
-            torch._dynamo.mark_static(
-                forward_batch.attn_backend.forward_metadata.block_kv_indices
-            )
+
         yield runner_fn
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
