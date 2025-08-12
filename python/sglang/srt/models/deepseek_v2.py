@@ -108,12 +108,14 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_non_idle_and_non_empty,
+    is_npu,
     log_info_on_rank0,
     use_intel_amx_backend,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -813,7 +815,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-            quant_config=quant_config,
+            quant_config=(
+                None if _is_npu else quant_config
+            ),  # NPU not support quantization method for kv_b_proj
             prefix=add_prefix("kv_b_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
@@ -970,6 +974,14 @@ class DeepseekV2AttentionMLA(nn.Module):
                     return AttnForwardMethod.MLA_FUSED_ROPE
                 else:
                     return AttnForwardMethod.MLA
+            elif _is_npu:
+                if (
+                    forward_batch.forward_mode.is_extend()
+                    and forward_batch.extend_num_tokens > 1
+                ):
+                    return AttnForwardMethod.MHA
+                else:
+                    return AttnForwardMethod.MLA
             else:
                 if hasattr(self, "fused_qkv_a_proj_with_mqa") and use_intel_amx_backend(
                     self
@@ -1072,8 +1084,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        if self.attn_mha.kv_b_proj is None:
-            self.attn_mha.kv_b_proj = self.kv_b_proj
+        if not _is_npu:
+            if self.attn_mha.kv_b_proj is None:
+                self.attn_mha.kv_b_proj = self.kv_b_proj
 
         if hidden_states.shape[0] == 0:
             assert (
@@ -1263,12 +1276,13 @@ class DeepseekV2AttentionMLA(nn.Module):
     def forward_absorb_core(
         self, q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
     ):
-        if (
-            self.current_attention_backend == "fa3"
-            or self.current_attention_backend == "flashinfer"
-            or self.current_attention_backend == "cutlass_mla"
-            or self.current_attention_backend == "trtllm_mla"
-        ):
+        if self.current_attention_backend in [
+            "fa3",
+            "flashinfer",
+            "cutlass_mla",
+            "trtllm_mla",
+            "npumla",
+        ]:
             attn_output = self.attn_mqa(
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
@@ -2489,6 +2503,10 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                 if "rotary_emb.inv_freq" in name:
                     continue
+                if "weight_offset" in name:
+                    if _is_npu:  # NPU not support for weight_offset now.
+                        continue
+
                 for param_name, weight_name, shard_id in stacked_params_mapping:
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
