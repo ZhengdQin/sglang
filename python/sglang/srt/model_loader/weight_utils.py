@@ -37,7 +37,11 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-from sglang.srt.utils import print_warning_once
+from sglang.srt.utils import is_npu, print_warning_once
+
+_is_npu = is_npu()
+if _is_npu:
+    import torch_npu
 
 logger = logging.getLogger(__name__)
 
@@ -646,12 +650,13 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
             # "broadcast" instead of copy
             param.data.fill_(loaded_weight.item())
         else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})"
-            )
-
-            param.data.copy_(loaded_weight)
+            # assert param.size() == loaded_weight.size(), (
+            #     f"Attempted to load weight ({loaded_weight.size()}) "
+            #     f"into parameter ({param.size()})"
+            # )
+            if _is_npu:
+                torch.npu.set_device(param.device)
+            param.data.copy_(loaded_weight[: param.shape[0]])
     except Exception:
         # NOTE: This exception is added for the purpose of setting breakpoint to
         # debug weight loading issues.

@@ -14,6 +14,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.parameter import (
     ChannelQuantScaleParameter,
     ModelWeightParameter,
@@ -787,8 +788,6 @@ class NPU_W8A8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.layers.linear import RowParallelLinear
-
         if isinstance(layer, RowParallelLinear):
             tp_rank = get_tensor_model_parallel_rank()
             return self.quant_method.apply(layer, x, bias, tp_rank)
@@ -826,20 +825,27 @@ class NPU_W8A8DynamicLinearMethodImpl:
     def apply(
         layer: torch.nn.Module,
         x: torch.Tensor,
+        dynamic_scale: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        out_dtype=torch.bfloat16,
         tp_rank: Optional[int] = 0,
     ) -> torch.Tensor:
-        original_dtype = x.dtype
-        # use ATB quantize
-        quant_out, dynamic_scale = torch_npu.npu_dynamic_quant(x)
-        return torch_npu.npu_quant_matmul(
+        if dynamic_scale is None:
+            quant_out, dynamic_scale = torch_npu.npu_dynamic_quant(x)
+        else:
+            quant_out = x
+        mm_out = torch_npu.npu_quant_matmul(
             quant_out,
             layer.weight,
             layer.weight_scale,
-            pertoken_scale=dynamic_scale,
+            pertoken_scale=None if out_dtype == torch.int32 else dynamic_scale,
             bias=bias,
-            output_dtype=original_dtype,
+            output_dtype=out_dtype,
         )
+        if out_dtype == torch.int32:
+            return mm_out, dynamic_scale
+        else:
+            return mm_out
 
     def process_weights_after_loading(self, layer):
         if self.transpose_weight:
@@ -911,14 +917,18 @@ class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
+        dynamic_scale: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        out_dtype=torch.bfloat16,
     ) -> torch.Tensor:
-        from sglang.srt.layers.linear import RowParallelLinear
-
         if isinstance(layer, RowParallelLinear):
             tp_rank = get_tensor_model_parallel_rank()
-            return self.quant_method.apply(layer, x, bias, tp_rank)
-        return self.quant_method.apply(layer, x, bias)
+            return self.quant_method.apply(
+                layer, x, dynamic_scale=dynamic_scale, bias=bias, tp_rank=tp_rank
+            )
+        return self.quant_method.apply(
+            layer, x, dynamic_scale=dynamic_scale, bias=bias, out_dtype=out_dtype
+        )
 
 
 class NPU_W8A8MoEMethod(FusedMoEMethodBase):

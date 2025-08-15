@@ -227,6 +227,7 @@ class ReplicatedLinear(LinearBase):
                     loaded_weight = loaded_weight[:1]
                 else:
                     raise ValueError(f"{loaded_weight} are not all equal")
+            torch.npu.set_device(param.device)
 
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
@@ -383,6 +384,8 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
+        if _is_npu:
+            torch.npu.set_device(param_data.device)
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -403,18 +406,24 @@ class ColumnParallelLinear(LinearBase):
             # However, we should fix this and avoid the branching here.
             param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, dynamic_scale=None, out_dtype=torch.bfloat16):
         bias = self.bias if not self.skip_bias_add else None
+        output_bias = self.bias if self.skip_bias_add else None
 
         # Matrix multiply.
-        assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        if _is_npu and out_dtype == torch.int32:
+            output_parallel, dynamic_scale = self.quant_method.apply(
+                self, input_, dynamic_scale, bias, out_dtype
+            )
+        else:
+            output_parallel = self.quant_method.apply(self, input_, bias)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
         else:
             output = output_parallel
-        output_bias = self.bias if self.skip_bias_add else None
+        if _is_npu and out_dtype == torch.int32:
+            return output, output_bias, dynamic_scale
         return output, output_bias
 
     def extra_repr(self) -> str:
@@ -1264,6 +1273,8 @@ class RowParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
 
         assert param_data.shape == loaded_weight.shape
+        if _is_npu:
+            torch.npu.set_device(param_data.device)
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
@@ -1287,7 +1298,12 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, can_fuse_mlp_allreduce=False):
+    def forward(
+        self,
+        input_,
+        can_fuse_mlp_allreduce=False,
+        dynamic_scale: Optional[torch.Tensor] = None,
+    ):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1302,7 +1318,14 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         with use_symmetric_memory(parallel_state.get_tp_group()) as sm:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if _is_npu:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, dynamic_scale=dynamic_scale, bias=bias_
+                )
+            else:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
             sm.tag(output_parallel)
         if self.reduce_results and self.tp_size > 1 and not can_fuse_mlp_allreduce:
             output = tensor_model_parallel_all_reduce(output_parallel)

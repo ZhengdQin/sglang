@@ -123,7 +123,9 @@ class NpuGraphRunner(DeviceRunnerBase):
                 device=input_ids.device,
             )
         elif self.require_attn_tp_gather:
-            global_num_tokens = torch.tensor([num_tokens], dtype=torch.int64, device=input_ids.device)
+            global_num_tokens = torch.tensor(
+                [num_tokens], dtype=torch.int64, device=input_ids.device
+            )
         else:
             global_num_tokens = None
             gathered_buffer = None
@@ -194,6 +196,7 @@ class NpuGraphRunner(DeviceRunnerBase):
         mark_tensor_static(forward_batch.out_cache_loc)
         mark_tensor_static(forward_batch.gathered_buffer)
         mark_tensor_static(forward_batch.attn_backend.forward_metadata.block_kv_indices)
+        mark_tensor_static(forward_batch.attn_backend.forward_metadata.mc2_mask)
         try:
             mark_tensor_static(forward_batch.token_to_kv_pool.k_buffer, is_cache=True)
             mark_tensor_static(forward_batch.token_to_kv_pool.v_buffer, is_cache=True)
@@ -209,7 +212,7 @@ class NpuGraphRunner(DeviceRunnerBase):
             return
 
         rank0_log("Warming up npu graph")
-        backend =  get_compiler_backend()
+        backend = get_compiler_backend()
         if not self.enable_cache:
             self.model_runner.model.compile_forward = torch.compile(
                 torch.no_grad()(self.model_runner.model.forward),
@@ -249,12 +252,22 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
             if self.enable_cache:
                 import torchair
 
-                method_name = f'forward_{bs}bs'
-                compile_method_name = f'compile_forward_{bs}bs'
-                setattr(self.model_runner.model, method_name, types.MethodType(build_method(method_name),
-                                                                               self.model_runner.model))
-                setattr(self.model_runner.model, compile_method_name,
-                        torchair.inference.cache_compile(getattr(self.model_runner.model, method_name), backend=backend))
+                method_name = f"forward_{bs}bs"
+                compile_method_name = f"compile_forward_{bs}bs"
+                setattr(
+                    self.model_runner.model,
+                    method_name,
+                    types.MethodType(
+                        build_method(method_name), self.model_runner.model
+                    ),
+                )
+                setattr(
+                    self.model_runner.model,
+                    compile_method_name,
+                    torchair.inference.cache_compile(
+                        getattr(self.model_runner.model, method_name), backend=backend
+                    ),
+                )
 
             # Run and capture
             def run_once():
@@ -274,17 +287,18 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
                     kwargs["pp_proxy_tensors"] = forward_batch.pp_proxy_tensors
                 self.mark_static(forward_batch, kwargs.get("pp_proxy_tensors"))
 
-                compile_forward = getattr(self.model_runner.model, compile_method_name) if self.enable_cache \
+                compile_forward = (
+                    getattr(self.model_runner.model, compile_method_name)
+                    if self.enable_cache
                     else self.model_runner.model.compile_forward
+                )
 
                 with torch.no_grad():
-                    logits_output_or_pp_proxy_tensors = (
-                        compile_forward(
-                            forward_batch.input_ids,
-                            forward_batch.positions,
-                            forward_batch,
-                            **kwargs,
-                        )
+                    logits_output_or_pp_proxy_tensors = compile_forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
                     )
                     return logits_output_or_pp_proxy_tensors
 
@@ -306,9 +320,12 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
             if pp_proxy_tensors is not None:
                 kwargs["pp_proxy_tensors"] = pp_proxy_tensors
 
-            compile_method_name = f'compile_forward_{forward_batch.input_ids.size(0)}bs'
-            compile_forward = getattr(self.model_runner.model, compile_method_name) if self.enable_cache \
+            compile_method_name = f"compile_forward_{forward_batch.input_ids.size(0)}bs"
+            compile_forward = (
+                getattr(self.model_runner.model, compile_method_name)
+                if self.enable_cache
                 else self.model_runner.model.compile_forward
+            )
             with torch.no_grad():
                 return compile_forward(
                     forward_batch.input_ids,

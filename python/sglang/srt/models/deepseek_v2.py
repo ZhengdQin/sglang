@@ -29,6 +29,7 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
+    get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
     parallel_state,
@@ -216,13 +217,30 @@ class DeepseekV2MLP(nn.Module):
             )
         self.act_fn = SiluAndMul()
 
-    def forward(self, x, forward_batch=None, can_fuse_mlp_allreduce=False):
+    def forward(
+        self, x, forward_batch=None, can_fuse_mlp_allreduce=False, dynamic_scale=None
+    ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
-
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, can_fuse_mlp_allreduce=can_fuse_mlp_allreduce)
+        if _is_npu:
+            gate_up, _, dynamic_scale = self.gate_up_proj(x, dynamic_scale, torch.int32)
+            down_input, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
+                gate_up,
+                weight_scale=self.gate_up_proj.weight_scale.float(),
+                activation_scale=dynamic_scale,
+                quant_scale=None,
+                activate_left=True,
+                quant_mode=1,
+            )
+            x, _ = self.down_proj(
+                down_input,
+                dynamic_scale=dynamic_scale,
+                can_fuse_mlp_allreduce=can_fuse_mlp_allreduce,
+            )
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
+            x, _ = self.down_proj(x, can_fuse_mlp_allreduce=can_fuse_mlp_allreduce)
         return x
 
 
@@ -285,7 +303,9 @@ class DeepseekV2MoE(nn.Module):
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.ep_rank = get_moe_expert_parallel_rank()
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.top_k = config.num_experts_per_tok
         self.n_shared_experts = config.n_shared_experts
         self.num_fused_shared_experts = (
             0
@@ -308,12 +328,20 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
+        self.route_share_on_same_card = True
+        self.experts_share_num_copy = 0
+        if self.route_share_on_same_card:
+            self.n_routed_experts = config.n_routed_experts
+        else:
+            config.n_routed_experts = 16  # todo (zyj)
+            self.n_routed_experts = 16
+
         self.gate = MoEGate(
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
         self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=self.top_k + self.num_fused_shared_experts,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -324,11 +352,11 @@ class DeepseekV2MoE(nn.Module):
         )
 
         self.experts = get_moe_impl_class()(
-            num_experts=config.n_routed_experts
+            num_experts=self.n_routed_experts
             + self.num_fused_shared_experts
             + global_server_args_dict["ep_num_redundant_experts"],
             num_fused_shared_experts=self.num_fused_shared_experts,
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=self.top_k + self.num_fused_shared_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
@@ -367,59 +395,67 @@ class DeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe
-            self.shared_experts = DeepseekV2MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=add_prefix("shared_experts", prefix),
-                **(
-                    dict(tp_rank=0, tp_size=1)
-                    if global_server_args_dict["moe_a2a_backend"].is_deepep()
-                    else {}
-                ),
-            )
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
-            self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
-            )
-            self.shared_experts_is_fp8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
-            )
-            if self.shared_experts_is_fp8:
-                assert (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+            if (
+                self.route_share_on_same_card
+                or self.ep_rank < self.experts_share_num_copy
+            ):
+                self.shared_experts = DeepseekV2MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    prefix=add_prefix("shared_experts", prefix),
+                    **(
+                        dict(tp_rank=0, tp_size=1)
+                        if global_server_args_dict["moe_a2a_backend"].is_deepep()
+                        else {}
+                    ),
                 )
-                self.shared_experts_weight_block_size = (
-                    self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                is_packed_weight = hasattr(
+                    self.shared_experts.gate_up_proj.quant_method, "quant_config"
+                ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
+                    "awq",
+                    "awq_marlin",
+                    "moe_wna16",
+                }
+                self.shared_experts_is_int8 = (
+                    not is_packed_weight
+                    and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
                 )
-
-        self.top_k = config.num_experts_per_tok
+                self.shared_experts_is_fp8 = (
+                    not is_packed_weight
+                    and self.shared_experts.gate_up_proj.weight.dtype
+                    == torch.float8_e4m3fn
+                )
+                if self.shared_experts_is_fp8:
+                    assert (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                        == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
+                    )
+                    self.shared_experts_weight_block_size = (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    )
+            else:
+                self.shared_experts = None
 
         if _is_npu:
-            self.dispatch_args = {
+            self.npu_dispatch_args = {
                 "n_shared_experts": config.n_shared_experts,
-                "n_routed_experts": config.n_routed_experts,
-                "num_experts_per_tok": config.num_experts_per_tok,
+                "n_routed_experts": self.n_routed_experts,
+                "num_experts_per_tok": self.top_k,
+                "route_share_on_same_card": self.route_share_on_same_card,
+                "experts_share_num_copy": self.experts_share_num_copy,
             }
         else:
-            self.dispatch_args = {}
+            self.npu_dispatch_args = {}
 
-        if global_server_args_dict["moe_a2a_backend"].is_deepep():
+        self._enable_deepep_moe = global_server_args_dict["moe_a2a_backend"].is_deepep()
+        if self._enable_deepep_moe:
             # TODO: we will support tp < ep in the future
             self.ep_size = get_moe_expert_parallel_world_size()
             self.num_experts = (
-                config.n_routed_experts
+                self.n_routed_experts
                 + global_server_args_dict["ep_num_redundant_experts"]
             )
             self.renormalize = config.norm_topk_prob
@@ -436,16 +472,14 @@ class DeepseekV2MoE(nn.Module):
                 router_topk=self.top_k,
                 permute_fusion=True,
                 num_experts=self.num_experts,
-                num_local_experts=config.n_routed_experts // self.tp_size,
+                num_local_experts=self.n_routed_experts // self.tp_size,
                 hidden_size=config.hidden_size,
                 params_dtype=config.torch_dtype,
                 deepep_mode=global_server_args_dict["deepep_mode"],
                 async_finish=True,
                 return_recv_hook=True,
-                **self.dispatch_args,
+                **self.npu_dispatch_args,
             )
-
-        self._enable_deepep_moe = global_server_args_dict["moe_a2a_backend"].is_deepep()
 
     def get_moe_weights(self):
         return [
@@ -649,18 +683,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: ForwardBatch,
         next_attn_weights: Dict = None,
     ) -> torch.Tensor:
-        pad_size = None
         forward_mode = forward_batch.forward_mode
-        if not global_server_args_dict["enable_torch_compile"]:
-            if forward_mode.is_extend():
-                pad_size = (
-                    forward_batch.seq_lens_sum // get_attention_tp_size() + 1
-                ) - hidden_states.size(0)
-            else:
-                pad_size = (
-                    forward_batch.batch_size // get_attention_tp_size() + 1
-                ) - hidden_states.size(0)
-            hidden_states = F.pad(hidden_states, [0, 0, 0, pad_size], "constant", 0)
         shared_output = None
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
 
@@ -673,7 +696,8 @@ class DeepseekV2MoE(nn.Module):
                 )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
-            shared_output = self._forward_shared_experts(hidden_states)
+            if self.route_share_on_same_card:
+                shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
                 router_logits,
@@ -694,7 +718,16 @@ class DeepseekV2MoE(nn.Module):
         dynamic_scale = None
 
         if self.ep_size > 1:
-            topk_ids = topk_idx
+            if not self.route_share_on_same_card:
+                topk_ids = (
+                    torch.arange(
+                        0, self.top_k, dtype=torch.int32, device=topk_idx.device
+                    )
+                    .view(1, -1)
+                    .repeat(hidden_states.shape[0], 1)
+                )  # todo
+            else:
+                topk_ids = topk_idx
             (
                 hidden_states,
                 dynamic_scale,
@@ -706,16 +739,21 @@ class DeepseekV2MoE(nn.Module):
                 expanded_row_idx,
             ) = self.deepep_dispatcher._inners[0]._normal_dispatcher.dispatch(
                 hidden_states=hidden_states,
-                topk_idx=topk_idx,
+                topk_idx=topk_ids,
                 topk_weights=topk_weights,
                 forward_batch=forward_batch,
             )
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            expert_tokens=expert_tokens,
-            dynamic_scale=dynamic_scale,
-            can_run_graph=forward_batch.can_run_graph,
-        )
+        if self.route_share_on_same_card or self.ep_rank >= self.experts_share_num_copy:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                expert_tokens=expert_tokens,
+                dynamic_scale=dynamic_scale,
+                can_run_graph=forward_batch.can_run_graph,
+            )
+        else:
+            final_hidden_states = self._forward_shared_experts(
+                hidden_states, dynamic_scale=dynamic_scale
+            )
         if self.ep_size > 1:
             if (
                 forward_batch.can_run_graph
@@ -756,14 +794,11 @@ class DeepseekV2MoE(nn.Module):
                 expanded_row_idx=expanded_row_idx,
             )
 
-        if (not global_server_args_dict["enable_torch_compile"]) and pad_size > 0:
-            final_hidden_states = final_hidden_states[:-pad_size, :]
-
         return final_hidden_states
 
-    def _forward_shared_experts(self, hidden_states):
+    def _forward_shared_experts(self, hidden_states, dynamic_scale=None):
         if self.num_fused_shared_experts == 0:
-            return self.shared_experts(hidden_states)
+            return self.shared_experts(hidden_states, dynamic_scale=dynamic_scale)
         else:
             return None
 
@@ -2922,7 +2957,9 @@ class DeepseekV2ForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias") or "shared_experts" in name
+                    ) and name not in params_dict:
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader

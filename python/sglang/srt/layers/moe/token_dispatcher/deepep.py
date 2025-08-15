@@ -643,9 +643,21 @@ class DeepEPDispatcher(BaseDispatcher):
                 **common_kwargs,
             )
         if self.deepep_mode.enable_normal():
-            dispatcher_cls = (
-                _DeepEPDispatcherImplNormal if not _is_npu else NpuDeepEPDispatcher
-            )
+            if _is_npu:
+                dispatcher_cls = _DeepEPDispatcherImplNpu
+                common_kwargs.update(
+                    {
+                        "n_shared_experts": kwargs.get("n_shared_experts"),
+                        "route_share_on_same_card": kwargs.get(
+                            "route_share_on_same_card", True
+                        ),
+                        "experts_share_num_copy": kwargs.get(
+                            "experts_share_num_copy", 0
+                        ),
+                    }
+                )
+            else:
+                dispatcher_cls = _DeepEPDispatcherImplNormal
             self._normal_dispatcher = dispatcher_cls(
                 async_finish=async_finish,
                 **common_kwargs,
@@ -721,7 +733,11 @@ class DeepEPDispatcher(BaseDispatcher):
         self._stage = new_stage
 
 
-class NpuDeepEPDispatcher:
+class _DeepEPDispatcherImplNpu:
+    """
+    route experts follow pure EP strategy
+    """
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -737,22 +753,28 @@ class NpuDeepEPDispatcher:
         **kwargs,
     ):
         self.group = group
-        self.experts_share_num_copy = 1
         self.n_routed_experts_per_rank = num_local_experts
-        self.route_share_on_same_card = True
-
-        self.n_shared_experts = kwargs.get("n_shared_experts")
         self.num_experts = num_experts
-        self.num_experts_per_tok = kwargs.get("num_experts_per_tok")
         self.hidden_size = hidden_size
-        self.global_rank = get_tensor_model_parallel_rank()
 
-        self.experts_tp_size = 1
+        self.experts_share_num_copy = kwargs.get("experts_share_num_copy", 0)
+        self.route_share_on_same_card = kwargs.get("route_share_on_same_card", True)
+        self.n_shared_experts = kwargs.get("n_shared_experts") or 0
+        self.num_experts_per_tok = kwargs.get("num_experts_per_tok")
+        self.global_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
+        self.experts_tp_size = 1
 
         self.group_name = group._get_backend(torch.device("npu")).get_hccl_comm_name(
             self.global_rank
         )
+
+        epsilon = 1e-2
+        self.smooth_scale = torch.nn.Parameter(
+            torch.ones(size=(self.num_experts, self.hidden_size), dtype=torch.float32)
+            * (1 - epsilon)
+            + epsilon
+        )  # smooth scale, now dpsk use smooth_scale == 1
 
         if self.route_share_on_same_card:
             self.shared_expert_rank_num = 0
@@ -760,12 +782,8 @@ class NpuDeepEPDispatcher:
             self.shared_expert_rank_num = (
                 self.n_shared_experts * self.experts_share_num_copy
             )
-        epsilon = 1e-2
-        self.smooth_scale = torch.nn.Parameter(
-            torch.ones(size=(self.num_experts, self.hidden_size), dtype=torch.float32)
-            * (1 - epsilon)
-            + epsilon
-        )  # smooth scale, now dpsk use smooth_scale == 1
+            self.num_experts -= self.shared_expert_rank_num  # todo
+        self.mc2_mask = None
 
     def dispatch(
         self,
@@ -775,11 +793,16 @@ class NpuDeepEPDispatcher:
         forward_batch: ForwardBatch,
     ) -> Tuple:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        topk_ids = topk_idx.to(torch.int)
         if forward_batch.is_extend_in_batch:
-            return self.dispatch_prefill(hidden_states, topk_ids)
+            return self.dispatch_prefill(hidden_states, topk_idx)
         else:
-            return self.dispatch_decode(hidden_states, topk_ids)
+            self.mc2_mask = forward_batch.attn_backend.forward_metadata.mc2_mask
+            if self.mc2_mask is not None:
+                bs_qlen = hidden_states.shape[0]
+                self.mc2_mask = self.mc2_mask[
+                    self.global_rank * bs_qlen : (self.global_rank + 1) * bs_qlen
+                ]
+            return self.dispatch_decode(hidden_states, topk_idx, self.mc2_mask)
 
     def dispatch_prefill(self, hidden_states, topk_ids) -> Tuple:
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = (
@@ -847,7 +870,7 @@ class NpuDeepEPDispatcher:
             expanded_row_idx,
         )
 
-    def dispatch_decode(self, hidden_states, topk_ids) -> Tuple:
+    def dispatch_decode(self, hidden_states, topk_ids, mc2_mask=None) -> Tuple:
         _kwargs = {
             "x": hidden_states,
             "expert_ids": topk_ids,
@@ -862,6 +885,7 @@ class NpuDeepEPDispatcher:
             "ep_rank_id": self.global_rank,
             "group_tp": self.group_name,
             "tp_world_size": self.experts_tp_size,
+            "x_active_mask": mc2_mask,
         }
         (
             hidden_states,
@@ -870,7 +894,7 @@ class NpuDeepEPDispatcher:
             expert_tokens,
             ep_recv_counts,
             tp_recv_counts,
-        ) = torch_npu.npu_moe_distribute_dispatch(**_kwargs)[:6]
+        ) = torch_npu.npu_moe_distribute_dispatch_v2(**_kwargs)[:6]
         return (
             hidden_states,
             dynamic_scale,
@@ -918,6 +942,7 @@ class NpuDeepEPDispatcher:
                 ep_send_counts,
                 tp_send_counts,
                 shared_output,
+                self.mc2_mask,
             )
 
     def combine_prefill(
@@ -961,11 +986,12 @@ class NpuDeepEPDispatcher:
         ep_send_counts,
         tp_send_counts,
         shared_output,
+        mc2_mask=None,
     ) -> Tuple:
         _kwargs = {
             "expand_x": hidden_states,
-            "expert_ids": topk_ids.to(torch.int),
-            "expand_idx": topk_idx,
+            "expert_ids": topk_ids,
+            "assist_info_for_combine": topk_idx,
             "expert_scales": topk_weights.to(torch.float32),
             "expert_shard_type": 0,
             "shared_expert_x": shared_output,
@@ -979,6 +1005,7 @@ class NpuDeepEPDispatcher:
             "tp_send_counts": tp_send_counts,
             "group_tp": self.group_name,
             "tp_world_size": self.experts_tp_size,
+            "x_active_mask": mc2_mask,
         }
-        hidden_states = torch_npu.npu_moe_distribute_combine(**_kwargs)
+        hidden_states = torch_npu.npu_moe_distribute_combine_v2(**_kwargs)
         return hidden_states

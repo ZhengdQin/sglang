@@ -35,7 +35,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import DynamicGradMode, get_compiler_backend
+from sglang.srt.utils import DynamicGradMode, get_compiler_backend, is_npu
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,14 @@ class TpModelWorkerClient:
     ):
         # Load the model
         self.worker = TpModelWorker(
-            server_args, gpu_id, tp_rank, moe_ep_rank, pp_rank, dp_rank, nccl_port, enable_overlap=True
+            server_args,
+            gpu_id,
+            tp_rank,
+            moe_ep_rank,
+            pp_rank,
+            dp_rank,
+            nccl_port,
+            enable_overlap=True,
         )
         self.max_running_requests = self.worker.max_running_requests
         self.device = self.worker.device
@@ -137,6 +144,8 @@ class TpModelWorkerClient:
 
     def forward_thread_func(self):
         try:
+            if is_npu():
+                torch.npu.set_device(self.device)
             with torch.get_device_module(self.device).stream(self.forward_stream):
                 self.forward_thread_func_()
         except Exception:

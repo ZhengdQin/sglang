@@ -50,6 +50,7 @@ class NpuMLADecodeMetadata:
         self.block_kv_indices = block_kv_indices
         self.seq_lens_list = seq_lens_list if seq_lens_list is not None else [1]
         self.seq_lens_list_cumsum = np.cumsum(self.seq_lens_list).tolist()
+        self.mc2_mask = None
         if (
             forward_batch.is_extend_in_batch
             or forward_batch.global_num_tokens_cpu is None
@@ -58,6 +59,15 @@ class NpuMLADecodeMetadata:
             self.seq_lens_list_cumsum[-1] = (
                 (self.seq_lens_list_cumsum[-1] - 1) // tp_size + 1
             ) * tp_size
+        elif forward_batch.global_num_tokens_for_logprob_cpu is not None:
+            vaild_batch = forward_batch.global_num_tokens_for_logprob_cpu[0]
+            assert vaild_batch <= forward_batch.batch_size
+            self.mc2_mask = torch.zeros(
+                forward_batch.batch_size,
+                dtype=torch.bool,
+                device=block_kv_indices.device,
+            )
+            self.mc2_mask[:vaild_batch].fill_(True)
 
 
 def create_npumla_kv_indices(
