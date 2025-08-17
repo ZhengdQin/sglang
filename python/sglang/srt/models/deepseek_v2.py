@@ -114,6 +114,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_non_idle_and_non_empty,
+    is_npu,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -125,6 +126,7 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _device_sm = get_device_sm()
 
 if _is_cuda:
@@ -2599,6 +2601,9 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                 if "rotary_emb.inv_freq" in name:
                     continue
+                if "weight_offset" in name:
+                    if _is_npu:  # NPU not support for weight_offset now.
+                        continue
                 for param_name, weight_name, shard_id in stacked_params_mapping:
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
 from types import MappingProxyType
 from typing import (
@@ -70,12 +71,14 @@ if _is_npu:
     else:
         useMindIETurbo = True
 
+logger = logging.getLogger(__name__)
+
 
 # func refers to RMSNorm.__init__
 def npu_wrapper_rmsnorm_init(func):
     def init(self, hidden_size: int, **extra_args) -> None:
         func(self, hidden_size, **extra_args)
-        self.ignore_anti = True
+        self.has_bias = True
         # The Ascend w8a8_int8 quantization requires adding a bias in rmsnorm
         self.bias = torch.nn.Parameter(torch.zeros(hidden_size), requires_grad=False)
 
@@ -191,7 +194,10 @@ class W8A8Int8Config(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.quant_description = quant_config
-        self.is_dynamic = quant_config.get("is_dynamic", False)
+        self.is_dynamic = (
+            quant_config.get("is_dynamic", False)
+            or quant_config.get("model_quant_type", "STATIC") == "W8A8_DYNAMIC"
+        )
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
@@ -201,6 +207,12 @@ class W8A8Int8Config(QuantizationConfig):
 
         if _is_npu:
             # Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models
+            if self.is_dynamic:
+                return
+            else:
+                logger.info(
+                    f"Ascend w8a8_int8 quantization with bias, use wrappers to isolate the effects between models, the corresponding forword_npu function is called in w8a8_int8.py"
+                )
             for name in self.quant_description.keys():
                 if "norm.bias" in name:
                     apply_module_patch(
@@ -269,10 +281,14 @@ class W8A8Int8Config(QuantizationConfig):
                         proj_name, packed_modules_mapping_subset[proj_name][0]
                     )
                 self.is_dynamic = (
+                    "model_quant_type" in self.quant_description
+                    and self.quant_description["model_quant_type"] == "W8A8_DYNAMIC"
+                ) or (
                     self.quant_description[prefix_in_quant_config + ".weight"]
                     == "W8A8_DYNAMIC"
                 )
                 if self.is_layer_skipped(prefix, packed_modules_mapping_subset):
+                    print(f"======>{prefix=} linear is bf16 linear", flush=True)
                     return UnquantizedLinearMethod()
                 return (
                     NPU_W8A8DynamicLinearMethod(self)
