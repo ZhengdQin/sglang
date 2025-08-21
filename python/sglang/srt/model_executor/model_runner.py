@@ -92,7 +92,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.npu_graph_runner import NpuGraphRunner
+from sglang.srt.model_executor.npu_graph_runner import NPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -1575,7 +1575,7 @@ class ModelRunner:
             f"Compile graph with npu begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            self.device_graph_runner = NpuGraphRunner(self)
+            self.device_graph_runner = NPUGraphRunner(self)
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
