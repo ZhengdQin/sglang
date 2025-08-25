@@ -274,6 +274,20 @@ class EAGLEWorker(TpModelWorker):
             self.draft_extend_attn_backend = AscendAttnBackend(
                 self.draft_model_runner,
             )
+        elif self.server_args.attention_backend == "npumla":
+            from sglang.srt.layers.attention.npumla_backend import (
+                NpuMLAAttnMultiStepDraftBackend,
+                NpuMLABackend,
+            )
+
+            self.draft_attn_backend = NpuMLAAttnMultiStepDraftBackend(
+                self.draft_model_runner,
+                self.topk,
+                self.speculative_num_steps,
+            )
+            self.draft_extend_attn_backend = NpuMLABackend(
+                self.draft_model_runner,
+            )
         else:
             raise ValueError(
                 f"EAGLE is not supported in attention backend {self.server_args.attention_backend}"

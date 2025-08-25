@@ -59,6 +59,25 @@ class NpuMLADecodeMetadata:
             self.seq_lens_list_cumsum[-1] = (
                 (self.seq_lens_list_cumsum[-1] - 1) // tp_size + 1
             ) * tp_size
+        elif forward_batch.forward_mode.is_target_verify():
+            bs = (
+                forward_batch.global_num_tokens_cpu[0]
+                // forward_batch.spec_info.draft_token_num
+            )
+            valid_bs = len(self.seq_lens_list)
+            assert valid_bs <= bs
+            if forward_batch.dp_padding_mode is not None and valid_bs < bs:
+                self.seq_lens_list += [0] * (bs - valid_bs)
+        elif forward_batch.forward_mode.is_draft_extend():
+            tp_size = get_attention_tp_size()
+            valid_bs = len(self.seq_lens_list)
+            bs = (valid_bs + tp_size - 1) // tp_size * tp_size
+            assert forward_batch.dp_padding_mode is None
+            if bs > valid_bs:
+                self.seq_lens_list += [0] * (bs - valid_bs)
+                self.block_kv_indices = F.pad(
+                    self.block_kv_indices, (0, 0, 0, bs - valid_bs), "constant", 0
+                )
         elif forward_batch.global_num_tokens_for_logprob_cpu is not None:
             vaild_batch = forward_batch.global_num_tokens_for_logprob_cpu[0]
             assert vaild_batch <= forward_batch.batch_size
@@ -157,7 +176,11 @@ class NpuMLABackend(TorchNativeAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.input_ids.size(0)
-        if forward_batch.forward_mode.is_decode_or_idle():
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+        ):
             block_kv_indices = torch.full(
                 (bs, self.max_seqlen_pad),
                 -1,
@@ -307,7 +330,10 @@ class NpuMLABackend(TorchNativeAttnBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+        if (
+            forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             if k_rope is not None:
                 if save_kv_cache:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -458,10 +484,18 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 k_nope = k_cache
                 k_rope = v_cache
 
-            q_nope = q_nope.reshape(b, s, n, self.kv_lora_rank)
-            q_rope = q_rope.reshape(b, s, n, self.qk_rope_head_dim)
-            sparse_mode = 0
-            atten_mask = None
+            if forward_batch.forward_mode.is_target_verify():
+                q_nope = q_nope.reshape(-1, self.num_draft_tokens, n, self.kv_lora_rank)
+                q_rope = q_rope.reshape(
+                    -1, self.num_draft_tokens, n, self.qk_rope_head_dim
+                )
+                sparse_mode = 3
+                atten_mask = self.attn_mask
+            else:
+                q_nope = q_nope.reshape(b, s, n, self.kv_lora_rank)
+                q_rope = q_rope.reshape(b, s, n, self.qk_rope_head_dim)
+                sparse_mode = 0
+                atten_mask = None
 
             attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
                 q_nope,
@@ -477,7 +511,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
                 scale=layer.scaling,
                 antiquant_mode=0,
                 antiquant_scale=None,
-                block_table=self.forward_metadata.block_kv_indices[:b],
+                block_table=self.forward_metadata.block_kv_indices[: q_nope.shape[0]],
                 block_size=self.page_size,
                 actual_seq_lengths_kv=self.forward_metadata.seq_lens_list,
             )
@@ -499,3 +533,72 @@ class NpuMLABackend(TorchNativeAttnBackend):
             )
         attn_output = attn_output.view(b * s, layer.tp_q_head_num, layer.v_head_dim)
         return attn_output
+
+
+class NpuMLAAttnMultiStepDraftBackend:
+    """
+    Wrap multiple NpuMLA attention backends as one for multiple consecutive
+    draft decoding steps
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+    ):
+        self.topk = topk
+        self.speculative_num_steps = speculative_num_steps
+
+        self.attn_backends = []
+        for _ in range(self.speculative_num_steps):
+            self.attn_backends.append(NpuMLABackend(model_runner))
+
+    def common_template(self, forward_batch: ForwardBatch, call_fn: int):
+        assert forward_batch.spec_info is not None
+
+        for i in range(self.speculative_num_steps - 1):
+            call_fn(i, forward_batch)
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        def call_fn(i, forward_batch):
+            assert forward_batch.spec_info is not None
+            self.attn_backends[i].init_forward_metadata(forward_batch)
+
+        self.common_template(forward_batch, call_fn)
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        for i in range(self.speculative_num_steps):
+            self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.batch_size * self.topk,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                forward_batch=forward_batch,
+            )
+
+        self.common_template(forward_batch, call_fn)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                seq_lens_sum=-1,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=None,
+            )
+
+        self.common_template(forward_batch, call_fn)

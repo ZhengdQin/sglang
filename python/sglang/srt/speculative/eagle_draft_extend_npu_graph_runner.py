@@ -60,3 +60,6 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
         thread.start()
         self.graphs[self.bs].replay()
         thread.join()
+
+    def can_run(self, forward_batch: ForwardBatch):
+        return False
