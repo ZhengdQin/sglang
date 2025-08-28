@@ -798,7 +798,10 @@ class _DeepEPDispatcherImplNpu:
         if forward_batch.is_extend_in_batch:
             return self.dispatch_prefill(hidden_states, topk_idx)
         else:
-            self.mc2_mask = forward_batch.attn_backend.forward_metadata.mc2_mask
+            if forward_batch.attn_backend.forward_metadata is None:
+                self.mc2_mask = None
+            else:
+                self.mc2_mask = forward_batch.attn_backend.forward_metadata.mc2_mask
             if self.mc2_mask is not None:
                 bs_qlen = hidden_states.shape[0]
                 if self.dps_size == self.world_size:

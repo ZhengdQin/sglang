@@ -1444,7 +1444,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            forward_batch.out_cache_loc,
+            forward_batch.out_cache_loc.to(torch.int64),
             value_cache,
             key_cache,
             k_rope_scale=None,

@@ -282,23 +282,20 @@ def _dp_gather_via_all_reduce(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    if (
-        local_tokens.shape[0] > 0
-        and (is_partial or get_attention_tp_rank() == 0)
-        and not is_npu()
-    ):
+    if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        memcpy_triton(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
-        )
-    elif is_npu():
-        # npu not support memcpy_triton
-        memcpy_npu(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
-        )
+        if is_npu():
+            # npu not support memcpy_triton
+            memcpy_npu(
+                global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+            )
+        else:
+            memcpy_triton(
+                global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+            )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -323,10 +320,15 @@ def _dp_gather_via_all_gather(
     if not is_partial:
         if get_attention_tp_rank() != 0:
             local_tokens.fill_(0)
-    scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
-        get_attention_tp_rank()
-    ]
-    get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    if get_attention_tp_size() > 1:
+        scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
+            get_attention_tp_rank()
+        ]
+        get_attention_tp_group().reduce_scatter_tensor(
+            scattered_local_tokens, local_tokens
+        )
+    else:
+        scattered_local_tokens = local_tokens
     get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
 
 
@@ -374,18 +376,19 @@ def dp_scatter(
     local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
-    if local_tokens.shape[0] > 0 and not is_npu():
+    if local_tokens.shape[0] > 0:
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
-        memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
-        )
-    elif is_npu():
-        memcpy_npu(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
-        )
+        if is_npu():
+            memcpy_npu(
+                local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            )
+        else:
+            memcpy_triton(
+                local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            )
     else:
         raise NotImplementedError("dp_scatter not implemented")
 

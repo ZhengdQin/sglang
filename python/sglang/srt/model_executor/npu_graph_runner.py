@@ -27,6 +27,7 @@ import torch
 import tqdm
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.layers.dp_attention import DPPaddingMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -110,6 +111,12 @@ class NPUGraphRunner(GraphRunner):
 
     def prepare_forward_batch(self, bs: int, num_tokens: int) -> ForwardBatch:
         # Graph inputs
+        if self.dp_size > 1:
+            global_num_tokens = num_tokens * self.dp_size
+            dp_padding_mode = DPPaddingMode.MAX_LEN
+        else:
+            global_num_tokens = num_tokens
+            dp_padding_mode = None
         with torch.device(self.model_runner.device):
             input_ids = torch.zeros((num_tokens,), dtype=torch.int64)
             req_pool_indices = torch.zeros((bs,), dtype=torch.int64)
@@ -120,7 +127,7 @@ class NPUGraphRunner(GraphRunner):
             if self.require_gathered_buffer:
                 gathered_buffer = torch.zeros(
                     (
-                        num_tokens,
+                        global_num_tokens,
                         self.model_runner.model_config.hidden_size,
                     ),
                     dtype=self.model_runner.dtype,
@@ -141,17 +148,20 @@ class NPUGraphRunner(GraphRunner):
 
         if self.require_mlp_tp_gather:
             global_num_tokens = torch.tensor(
-                [
-                    num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
-                    for i in range(self.dp_size)
-                ],
+                [num_tokens for i in range(self.dp_size)],
                 dtype=torch.int64,
                 device=input_ids.device,
             )
+            global_num_tokens_cpu = [num_tokens for i in range(self.dp_size)]
+            global_num_tokens_for_logprob_cpu = [
+                num_tokens for i in range(self.dp_size)
+            ]
         elif self.require_attn_tp_gather:
             global_num_tokens = torch.tensor(
                 [num_tokens], dtype=torch.int64, device=input_ids.device
             )
+            global_num_tokens_cpu = [num_tokens]
+            global_num_tokens_for_logprob_cpu = [num_tokens]
         else:
             global_num_tokens = None
             gathered_buffer = None
@@ -187,10 +197,11 @@ class NPUGraphRunner(GraphRunner):
             global_forward_mode=None,
             mm_inputs=[None] * bs,
             lora_ids=[None] * bs,
-            global_num_tokens_cpu=[num_tokens],
-            global_num_tokens_for_logprob_cpu=[num_tokens],
+            global_num_tokens_cpu=global_num_tokens_cpu,
+            global_num_tokens_for_logprob_cpu=global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens.clone(),
             can_run_graph=True,
+            dp_padding_mode=dp_padding_mode,
         )
         return forward_batch
 
@@ -362,6 +373,13 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
         yield runner_fn
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
+        if forward_batch.dp_padding_mode == DPPaddingMode.MAX_LEN:
+            return bool(
+                self.enable_torch_compile
+                and forward_batch.batch_size in self.compile_bs
+                and not forward_batch.is_extend_in_batch
+                and len(set(forward_batch.global_num_tokens_for_logprob_cpu)) == 1
+            )
         return bool(
             forward_batch.forward_mode.is_decode()
             and self.enable_torch_compile

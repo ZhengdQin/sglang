@@ -745,7 +745,7 @@ def alloc_extend_native(
             prefix_lens, seq_lens, last_loc, free_pages, page_size, extend_lens
         )
 
-    return out_indices.to(dtype=torch.int64), estimated_num_new_pages
+    return out_indices.to(dtype=torch.int32), estimated_num_new_pages
 
 
 class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
