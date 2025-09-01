@@ -718,9 +718,10 @@ def alloc_extend_native(
     speculative_num_draft_tokens,
 ):
     extend_lens = seq_lens - prefix_lens
-    indices_1 = torch.where(extend_lens == 1)[0]  # no accept
-    indices_2 = torch.where(extend_lens == 2)[0]  # accept one token
-    if len(indices_1) > 0 and len(indices_2) == 0:
+    if speculative_num_draft_tokens == 2:
+        indices_1 = torch.where(extend_lens == 1)[0]  # no accept
+        indices_2 = torch.where(extend_lens == 2)[0]  # accept one token
+    if speculative_num_draft_tokens == 2 and len(indices_1) > 0 and len(indices_2) == 0:
         out_indices = alloc_decode_kernel_ascend(
             seq_lens,
             last_loc,
@@ -729,7 +730,7 @@ def alloc_extend_native(
             estimated_num_new_pages,
         )
     elif (
-        len(indices_1) == 0 and len(indices_2) > 0 and speculative_num_draft_tokens == 2
+        speculative_num_draft_tokens == 2 and len(indices_1) == 0 and len(indices_2) > 0
     ):
         out_indices = alloc_extend_mtp(
             prefix_lens,

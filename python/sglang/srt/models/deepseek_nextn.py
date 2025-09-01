@@ -22,6 +22,7 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -72,6 +73,18 @@ class DeepseekModelNextN(nn.Module):
             is_nextn=True,
             prefix=add_prefix("decoder", prefix),
         )
+
+        self.norm_bias = {}
+        if self.decoder.self_attn.npu_use_rope_cache:
+            attn_tp_size = get_attention_tp_size()
+            q_lora_rank = self.decoder.self_attn.q_lora_rank
+            for batch_size in range(attn_tp_size, attn_tp_size * 6 + 1, attn_tp_size):
+                self.norm_bias[batch_size] = torch.zeros(
+                    [batch_size, q_lora_rank], dtype=torch.bfloat16, device="npu"
+                )
+                torch._dynamo.mark_static(self.norm_bias[batch_size])
+
+            self.decoder.self_attn.norm_bias = self.norm_bias
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

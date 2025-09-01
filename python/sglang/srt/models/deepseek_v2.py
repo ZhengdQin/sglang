@@ -1144,12 +1144,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             "npu_use_rope_cache", False
         )
         if _is_npu and self.npu_use_rope_cache:
-            self.norm_res = {}
-            for batch_size in range(attn_tp_size, attn_tp_size * 4 + 1, attn_tp_size):
-                self.norm_res[batch_size] = torch.zeros(
-                    [batch_size, self.q_lora_rank], dtype=torch.bfloat16, device="npu"
-                )
-                torch._dynamo.mark_static(self.norm_res[batch_size])
+            self.norm_bias = None
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -1578,7 +1573,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_lowrank, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q, _ = self.q_a_layernorm(q_lowrank, self.norm_res[q_lowrank.shape[0]])
+            q, _ = self.q_a_layernorm(q_lowrank, self.norm_bias[q_lowrank.shape[0]])
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(
@@ -2413,6 +2408,19 @@ class DeepseekV2Model(nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
+        self.norm_bias = {}
+        if _is_npu and self.layers[0].self_attn.npu_use_rope_cache:
+            attn_tp_size = get_attention_tp_size()
+            q_lora_rank = self.layers[0].self_attn.q_lora_rank
+            for batch_size in range(attn_tp_size, attn_tp_size * 6 + 1, attn_tp_size):
+                self.norm_bias[batch_size] = torch.zeros(
+                    [batch_size, q_lora_rank], dtype=torch.bfloat16, device="npu"
+                )
+                torch._dynamo.mark_static(self.norm_bias[batch_size])
+
+        for layer in self.layers:
+            layer.self_attn.norm_bias = self.norm_bias
+
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def get_input_embeddings(self) -> torch.Tensor:
