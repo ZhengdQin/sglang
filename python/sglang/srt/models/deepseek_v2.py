@@ -230,7 +230,7 @@ class DeepseekV2MLP(nn.Module):
             gate_up, _, dynamic_scale = self.gate_up_proj(x, dynamic_scale, torch.int32)
             down_input, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(
                 gate_up,
-                weight_scale=self.gate_up_proj.weight_scale.float(),
+                weight_scale=self.gate_up_proj.weight_scale_fp32,
                 activation_scale=dynamic_scale,
                 quant_scale=None,
                 activate_left=True,
@@ -1447,7 +1447,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            forward_batch.out_cache_loc.to(torch.int64),
+            forward_batch.out_cache_loc,
             value_cache,
             key_cache,
             k_rope_scale=None,

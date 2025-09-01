@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Union
 
 import torch
 import tqdm
+
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
@@ -33,10 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.graph_runner import GraphRunner
-from sglang.srt.utils import (
-    get_available_gpu_memory,
-    get_compiler_backend,
-)
+from sglang.srt.utils import get_available_gpu_memory, get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
@@ -266,8 +264,8 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
                     self.pp_size > 1
                     and "pp_proxy_tensors"
                     in inspect.signature(
-                    self.model_runner.model.compile_forward
-                ).parameters
+                        self.model_runner.model.compile_forward
+                    ).parameters
                 ):
                     kwargs["pp_proxy_tensors"] = forward_batch.pp_proxy_tensors
                 self.mark_static(forward_batch, kwargs.get("pp_proxy_tensors"))
@@ -339,7 +337,9 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
                 if pp_proxy_tensors is not None:
                     kwargs["pp_proxy_tensors"] = pp_proxy_tensors
 
-                compile_method_name = f"compile_forward_{forward_batch.input_ids.size(0)}bs"
+                compile_method_name = (
+                    f"compile_forward_{forward_batch.input_ids.size(0)}bs"
+                )
                 compile_forward = (
                     getattr(self.model_runner.model, compile_method_name)
                     if self.enable_cache
@@ -353,7 +353,9 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
                         **kwargs,
                     )
             else:
-                return self.replay(forward_batch, skip_attn_backend_init, pp_proxy_tensors)
+                return self.replay(
+                    forward_batch, skip_attn_backend_init, pp_proxy_tensors
+                )
 
         if not skip_attn_backend_init:
             forward_batch.attn_backend.init_forward_metadata(forward_batch)

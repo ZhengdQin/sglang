@@ -248,7 +248,7 @@ class TopK(CustomOp):
             return torch_npu.npu_moe_gating_top_k(
                 router_logits,
                 k=self.top_k,
-                bias=self.correction_bias.to(router_logits.dtype),
+                bias=self.correction_bias,
                 k_group=self.topk_group,
                 group_count=self.num_expert_group,
                 group_select_mode=1,
@@ -749,6 +749,7 @@ def select_experts(
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,
+            correction_bias=correction_bias,
             topk=top_k,
             renormalize=renormalize,
         )

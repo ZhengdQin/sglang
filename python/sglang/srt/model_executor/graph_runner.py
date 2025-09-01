@@ -21,7 +21,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Callable, Optional, Union, Generator, Any
+from typing import TYPE_CHECKING, Any, Callable, Generator, Optional, Union
 
 import torch
 import tqdm
@@ -855,6 +855,7 @@ class GraphRunner:
             return self.replay(forward_batch, skip_attn_backend_init, pp_proxy_tensors)
 
         yield runner_fn
+
 
 GRAPH_CAPTURE_FAILED_MSG = (
     "Possible solutions:\n"

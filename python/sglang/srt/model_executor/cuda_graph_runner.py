@@ -35,4 +35,3 @@ class CudaGraphRunner(GraphRunner):
 
     def _create_device_graph(self):
         return torch.cuda.CUDAGraph()
-
