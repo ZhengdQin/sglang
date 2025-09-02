@@ -856,12 +856,13 @@ class NPU_W8A8DynamicLinearMethodImpl:
         else:
             return mm_out
 
-    def process_weights_after_loading(self, layer):
+    def process_weights_after_loading(self, layer, layer_path):
         if self.transpose_weight:
             layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.flatten()
-        layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
         layer.weight_offset.data = layer.weight_offset.data.flatten()
+        if _is_npu and layer_path is not None:
+            layer.weight_scale.data = layer.weight_scale.data.to(torch.float32)
 
 
 class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
@@ -918,9 +919,11 @@ class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
             layer.register_parameter(perchannel_name, param)
             set_weight_attrs(param, extra_weight_attrs)
 
-    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    def process_weights_after_loading(self, layer: torch.nn.Module, **kwargs) -> None:
         if hasattr(self.quant_method, "process_weights_after_loading"):
-            self.quant_method.process_weights_after_loading(layer)
+            self.quant_method.process_weights_after_loading(
+                layer, layer_path=kwargs.get("layer_path")
+            )
 
     def apply(
         self,
