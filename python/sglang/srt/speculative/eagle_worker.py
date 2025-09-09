@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 
+_is_npu = is_npu()
 if is_cuda():
     from sgl_kernel import segment_packbits
 
@@ -109,7 +110,7 @@ class EAGLEWorker(TpModelWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        if is_npu():
+        if _is_npu:
             self.token_to_kv_pool_allocator.speculative_num_draft_tokens = (
                 self.speculative_num_draft_tokens
             )
@@ -169,6 +170,7 @@ class EAGLEWorker(TpModelWorker):
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
         )
+        self.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -300,7 +302,12 @@ class EAGLEWorker(TpModelWorker):
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
-        if self.server_args.disable_cuda_graph:
+        if _is_npu and not self.model_runner.is_draft_worker:
+            self.model_runner.init_npu_graphs()
+        if (
+            not self.model_runner.server_args.enable_torch_compile
+            or self.server_args.disable_cuda_graph
+        ):
             return
 
         # Capture draft

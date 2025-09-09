@@ -507,7 +507,7 @@ class ServerArgs:
 
         # DeepEP MoE
         if self.moe_a2a_backend == "deepep":
-            if self.deepep_mode == "normal":
+            if self.attention_backend != "npumla" and self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
             self.ep_size = self.tp_size

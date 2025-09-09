@@ -576,7 +576,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 def alloc_decode_kernel_ascend(
     seq_lens, last_loc, free_pages, page_size, estimated_num_new_pages
 ):
-    out_indices = (last_loc + 1).to(dtype=torch.int32)
+    out_indices = (last_loc + 1).to(dtype=torch.int64)
     if estimated_num_new_pages > 0:
         need_new_page_idx = torch.where(seq_lens % page_size == 1)[0]
         out_indices[need_new_page_idx] = (
@@ -593,7 +593,7 @@ def alloc_extend_general(
     total_extend_tokens = extend_lens.sum().item()
 
     # Step 2: Build output buffer
-    out_indices = torch.empty(total_extend_tokens, dtype=torch.int32, device="cpu")
+    out_indices = torch.empty(total_extend_tokens, dtype=torch.int64, device="cpu")
 
     part1_ends = torch.min(
         seq_lens, ((pre_lens + page_size - 1) // page_size) * page_size
@@ -683,7 +683,7 @@ def alloc_extend_mtp(
             -1, speculative_num_draft_tokens
         )
         + DRAFT_TOKEN_NUM_RANGE
-    ).to(dtype=torch.int32)
+    ).to(dtype=torch.int64)
     if estimated_num_new_pages > 0:
         need_new_page_idx_1 = torch.where((prefix_lens + 1) % page_size == 0)[0]
         need_new_page_idx_2 = torch.where(prefix_lens % page_size == 0)[0]
@@ -745,7 +745,7 @@ def alloc_extend_native(
             prefix_lens, seq_lens, last_loc, free_pages, page_size, extend_lens
         )
 
-    return out_indices.to(dtype=torch.int32), estimated_num_new_pages
+    return out_indices, estimated_num_new_pages
 
 
 class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
@@ -759,7 +759,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         kvcache: KVCache,
     ):
         super().__init__(size, page_size, dtype, device, kvcache)
-        self.ret_values = torch.empty((), dtype=torch.int32, device=self.device)
+        self.ret_values = torch.empty((), dtype=torch.int64, device=self.device)
         self.speculative_num_draft_tokens = None
 
     def alloc_extend(
@@ -798,7 +798,7 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[estimated_num_new_pages:]
-        return out_indices
+        return out_indices.to(dtype=torch.int64)
 
     def alloc_decode(
         self,
@@ -833,9 +833,9 @@ class AscendPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[estimated_num_new_pages:]
-        return out_indices
+        return out_indices.to(dtype=torch.int64)
 
     def clear(self):
         super().clear()
-        self.free_pages = self.free_pages.to(torch.int32)
-        self.release_pages = self.release_pages.to(torch.int32)
+        self.free_pages = self.free_pages.to(torch.int64)
+        self.release_pages = self.release_pages.to(torch.int64)

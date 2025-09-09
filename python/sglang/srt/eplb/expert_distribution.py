@@ -28,8 +28,9 @@ from sglang.srt.eplb.expert_location import ExpertLocationMetadata
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_bool_env_var
+from sglang.srt.utils import Withable, get_bool_env_var, is_npu
 
+_is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 # --------------------------------------- Entrypoint -----------------------------------------
@@ -125,6 +126,9 @@ class NpuExpertDistributionRecorder(ExpertDistributionRecorder):
         pass
 
     def with_current_layer(self, layer_idx):
+        return self
+
+    def disable_this_region(self):
         return self
 
 
@@ -277,8 +281,8 @@ _global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = (
 )
 
 
-def get_global_expert_distribution_recorder(is_npu: bool = False):
-    if is_npu:
+def get_global_expert_distribution_recorder():
+    if _is_npu:
         return NpuExpertDistributionRecorder()
     else:
         return _global_expert_distribution_recorder
