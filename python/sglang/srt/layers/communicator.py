@@ -28,6 +28,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
     dp_scatter,
+    get_attention_dp_rank,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -403,26 +404,34 @@ class CommunicateWithAllReduceAndLayerNormFn:
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
         if context.attn_dp_size != 1:
-            if context.attn_tp_rank == 0:
+            if 0:  # get_attention_dp_size() == get_tensor_model_parallel_world_size():
+                # TODO: has precision problems.
+                # when tp_size == dp_size, we can skip all gather and scatter:
                 hidden_states += residual
-
-            # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
-            use_layer_norm_before_gather = context.attn_tp_size == 1
-            if use_layer_norm_before_gather:
                 residual.copy_(hidden_states)
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
+            else:
+                if context.attn_tp_rank == 0:
+                    hidden_states += residual
 
-            hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer,
-                hidden_states,
-            )
-            dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
+                use_layer_norm_before_gather = context.attn_tp_size == 1
+                if use_layer_norm_before_gather:
+                    residual.copy_(hidden_states)
+                    if hidden_states.shape[0] != 0:
+                        hidden_states = layernorm(hidden_states)
 
-            if not use_layer_norm_before_gather:
-                dp_scatter(residual, hidden_states, forward_batch)
-                if hidden_states.shape[0] != 0:
-                    hidden_states = layernorm(hidden_states)
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer,
+                    hidden_states,
+                )
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+
+                if not use_layer_norm_before_gather:
+                    dp_scatter(residual, hidden_states, forward_batch)
+                    if hidden_states.shape[0] != 0:
+                        hidden_states = layernorm(hidden_states)
         else:
             # According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
             # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
@@ -538,12 +547,23 @@ class CommunicateSummableTensorPairFn:
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # important: forward batch.gathered_buffer is used both after scatter and after gather.
         # be careful about this!
-        hidden_states, global_hidden_states = (
-            forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
-            hidden_states,
-        )
-        dp_scatter(hidden_states, global_hidden_states, forward_batch)
-        return hidden_states, residual
+        if 0:  # get_attention_dp_size() == get_tensor_model_parallel_world_size():
+            # TODO: has precision problems
+            # when dp_size == world size, there is no need to do scatter and allgather
+            return hidden_states, residual
+        else:
+            hidden_states, global_hidden_states = (
+                forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                hidden_states,
+            )
+            if context.attn_tp_size == 1:
+                global_hidden_states = global_hidden_states.view(
+                    context.attn_dp_size, -1, global_hidden_states.size(-1)
+                )
+                hidden_states = global_hidden_states[get_attention_dp_rank()]
+            else:
+                dp_scatter(hidden_states, global_hidden_states, forward_batch)
+            return hidden_states, residual
 
     @staticmethod
     def _gather(

@@ -18,7 +18,12 @@ import torch_npu
 
 from sglang.global_config import global_config
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    DPPaddingMode,
+    get_attention_dp_rank,
+    get_attention_dp_size,
+    get_attention_tp_size,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -48,14 +53,19 @@ class NpuMLAMetadata:
         self.q_lens_list = seq_lens_list or [1]
 
         if (
-            forward_batch.is_extend_in_batch
+            forward_batch.forward_mode == ForwardMode.EXTEND
             or forward_batch.global_num_tokens_cpu is None
         ):
             tp_size = get_attention_tp_size()
             self.kv_lens_list = np.cumsum(self.q_lens_list).tolist()
-            self.kv_lens_list[-1] = (
-                (self.kv_lens_list[-1] - 1) // tp_size + 1
-            ) * tp_size
+            if forward_batch.dp_padding_mode == DPPaddingMode.MAX_LEN:
+                # DPPaddingMode.MAX_LEN
+                self.kv_lens_list[-1] = forward_batch.input_ids.size(0)
+            else:
+                # DPPaddingMode.SUM_LEN
+                self.kv_lens_list[-1] = (
+                    (self.kv_lens_list[-1] - 1) // tp_size + 1
+                ) * tp_size
         elif forward_batch.forward_mode.is_target_verify():
             draft_token_num = forward_batch.spec_info.draft_token_num
             kv_lens = np.array(seq_lens_list) + draft_token_num
@@ -91,7 +101,9 @@ class NpuMLAMetadata:
         elif forward_batch.global_num_tokens_for_logprob_cpu is not None:
             self.kv_lens_list = copy.copy(self.q_lens_list)
             self.q_lens_list = list(range(1, len(self.q_lens_list) + 1))
-            vaild_batch = forward_batch.global_num_tokens_for_logprob_cpu[0]
+            vaild_batch = forward_batch.global_num_tokens_for_logprob_cpu[
+                get_attention_dp_rank()
+            ]
             assert vaild_batch <= forward_batch.batch_size
             self.mc2_mask = torch.zeros(
                 forward_batch.batch_size,
@@ -117,7 +129,7 @@ def create_npumla_kv_indices(
         req_to_token_ptr[req_pool_indices_ptr, :seq_lens_max][:, ::page_size]
         // page_size
     )
-    kv_indices_ptr[:, : block_table.shape[1]].copy_(block_table)
+    kv_indices_ptr[: block_table.shape[0], : block_table.shape[1]].copy_(block_table)
 
 
 class NpuMLABackend(TorchNativeAttnBackend):

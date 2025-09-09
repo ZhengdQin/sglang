@@ -24,6 +24,7 @@ from torch import nn
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from sglang.srt.layers.dp_attention import (
@@ -118,6 +119,8 @@ class LogitsMetadata:
     dp_padding_mode: Optional[DPPaddingMode] = None
     # for padding
     padded_static_len: int = -1
+    can_run_graph: bool = False
+    is_extend_in_batch: bool = False
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
@@ -169,6 +172,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DPPaddingMode.SUM_LEN,
+            is_extend_in_batch=forward_batch.is_extend_in_batch,
         )
 
     def compute_dp_attention_metadata(self):
@@ -198,6 +202,13 @@ class LogitsMetadata:
             )
         else:
             self.gathered_buffer = torch.empty_like(self.gathered_buffer)
+
+        self.can_run_graph = False
+        if (
+            len(set(self.global_num_tokens_for_logprob_cpu)) == 1
+            and not self.is_extend_in_batch
+        ):
+            self.can_run_graph = True
 
 
 class LogitsProcessor(nn.Module):
@@ -233,6 +244,8 @@ class LogitsProcessor(nn.Module):
         self.debug_tensor_dump_output_folder = global_server_args_dict.get(
             "debug_tensor_dump_output_folder", None
         )
+        self.dp_size = get_attention_dp_size()
+        self.dp_rank = get_attention_dp_rank()
 
     def forward(
         self,
@@ -500,15 +513,19 @@ class LogitsProcessor(nn.Module):
                 logits = tensor_model_parallel_all_gather(logits)
 
         if self.do_tensor_parallel_all_gather_dp_attn:
-            logits, global_logits = (
-                torch.empty(
-                    (local_hidden_states.shape[0], logits.shape[1]),
-                    device=logits.device,
-                    dtype=logits.dtype,
-                ),
-                logits,
-            )
-            dp_scatter(logits, global_logits, logits_metadata)
+            if logits_metadata.can_run_graph:
+                global_logits = logits.view(self.dp_size, -1, logits.size(-1))
+                logits = global_logits[self.dp_rank]
+            else:
+                logits, global_logits = (
+                    torch.empty(
+                        (local_hidden_states.shape[0], logits.shape[1]),
+                        device=logits.device,
+                        dtype=logits.dtype,
+                    ),
+                    logits,
+                )
+                dp_scatter(logits, global_logits, logits_metadata)
 
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer

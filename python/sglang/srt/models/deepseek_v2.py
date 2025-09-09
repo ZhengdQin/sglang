@@ -711,11 +711,13 @@ class DeepseekV2MoE(nn.Module):
                 ),
             )
         else:
-            topk_idx = torch.full(
-                (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
-            )
+            topk_idx = torch.randperm(
+                256, device=hidden_states.device, dtype=torch.int32
+            )[: self.top_k].repeat(hidden_states.size(0), 1)
             topk_weights = torch.empty(
-                (0, self.top_k), dtype=torch.float32, device=hidden_states.device
+                (hidden_states.size(0), self.top_k),
+                dtype=torch.float32,
+                device=hidden_states.device,
             )
 
         expert_tokens = None
@@ -1442,7 +1444,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            forward_batch.out_cache_loc,
+            forward_batch.out_cache_loc.to(torch.int64),
             value_cache,
             key_cache,
             k_rope_scale=None,
@@ -1573,7 +1575,11 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_lowrank, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q, _ = self.q_a_layernorm(q_lowrank, self.norm_bias[q_lowrank.shape[0]])
+            if self.norm_bias.get(q_lowrank.shape[0]) is None:
+                # In case when there is no zero norm in dict, we may not use add rmsnorm
+                q = self.q_a_layernorm(q_lowrank)
+            else:
+                q, _ = self.q_a_layernorm(q_lowrank, self.norm_bias[q_lowrank.shape[0]])
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
             q = self.q_proj(hidden_states)[0].view(

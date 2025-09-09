@@ -18,6 +18,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.dp_attention import DPPaddingMode, get_attention_dp_size
 from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
     BaseDispatcher,
     BaseDispatcherConfig,
@@ -763,6 +764,7 @@ class _DeepEPDispatcherImplNpu:
         self.num_experts_per_tok = kwargs.get("num_experts_per_tok")
         self.global_rank = get_tensor_model_parallel_rank()
         self.world_size = get_tensor_model_parallel_world_size()
+        self.dps_size = get_attention_dp_size()
         self.experts_tp_size = 1
 
         self.group_name = group._get_backend(torch.device("npu")).get_hccl_comm_name(
@@ -796,12 +798,19 @@ class _DeepEPDispatcherImplNpu:
         if forward_batch.is_extend_in_batch:
             return self.dispatch_prefill(hidden_states, topk_idx)
         else:
-            self.mc2_mask = forward_batch.attn_backend.forward_metadata.mc2_mask
+            if forward_batch.attn_backend.forward_metadata is None:
+                self.mc2_mask = None
+            else:
+                self.mc2_mask = forward_batch.attn_backend.forward_metadata.mc2_mask
             if self.mc2_mask is not None:
                 bs_qlen = hidden_states.shape[0]
-                self.mc2_mask = self.mc2_mask[
-                    self.global_rank * bs_qlen : (self.global_rank + 1) * bs_qlen
-                ]
+                if self.dps_size == self.world_size:
+                    # Every NPU has an mc_mask when dp_size == world_size
+                    self.mc2_mask = self.mc2_mask[:bs_qlen]
+                else:
+                    self.mc2_mask = self.mc2_mask[
+                        self.global_rank * bs_qlen : (self.global_rank + 1) * bs_qlen
+                    ]
             return self.dispatch_decode(hidden_states, topk_idx, self.mc2_mask)
 
     def dispatch_prefill(self, hidden_states, topk_ids) -> Tuple:
