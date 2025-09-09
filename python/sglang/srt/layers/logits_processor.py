@@ -459,7 +459,13 @@ class LogitsProcessor(nn.Module):
                 logits_metadata.gathered_buffer,
                 hidden_states,
             )
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            if logits_metadata.can_run_graph:
+                # all gather the data from each dp rank
+                get_tp_group().all_gather_into_tensor(
+                    hidden_states, local_hidden_states
+                )
+            else:
+                dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
 
         if hasattr(lm_head, "weight"):
             if use_intel_amx_backend(lm_head):
