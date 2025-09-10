@@ -446,8 +446,8 @@ class DefaultModelLoader(BaseModelLoader):
 
         if _is_npu:
             for name, param in model.named_parameters():
-                if "mlp.gate.e_score_correction_bias" in name:
-                    param.data = param.data.to(torch.bfloat16)
+                if "mlp.gate.weight" in name:
+                    param.data = param.data.to(torch.float32)
 
         for name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
