@@ -1569,6 +1569,9 @@ class ModelRunner:
         if not self.server_args.enable_torch_compile:
             return
 
+        if self.is_draft_worker and self.server_args.disable_cuda_graph:
+            return
+
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(

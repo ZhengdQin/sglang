@@ -69,6 +69,7 @@ class NpuMLAMetadata:
         elif forward_batch.forward_mode.is_target_verify():
             draft_token_num = forward_batch.spec_info.draft_token_num
             kv_lens = np.array(seq_lens_list) + draft_token_num
+            kv_lens[forward_batch.batch_size :] = 0
             self.kv_lens_list = kv_lens.tolist()
             valid_bs = len(self.q_lens_list)
             self.q_lens_list = list(
@@ -82,22 +83,33 @@ class NpuMLAMetadata:
                 )
                 if fake_tokens > 0:
                     self.q_lens_list[-1] = forward_batch.global_num_tokens_cpu[0]
-                    # self.q_lens_list.append(forward_batch.global_num_tokens_cpu[0])
-                    # self.kv_lens_list.append(0)
-            self.block_kv_indices = self.block_kv_indices[: len(self.q_lens_list)]
+
+            # self.block_kv_indices = self.block_kv_indices[
+            #     : len(self.q_lens_list)
+            # ].clone()
         elif forward_batch.forward_mode.is_draft_extend():
             tp_size = get_attention_tp_size()
-            self.kv_lens_list = copy.copy(self.q_lens_list)
+            self.kv_lens_list = self.q_lens_list
             self.q_lens_list = np.cumsum(forward_batch.extend_seq_lens_cpu).tolist()
-            align_global_num_tokens = (
-                (forward_batch.extend_num_tokens + tp_size - 1) // tp_size * tp_size
-            )
-            fake_tokens = align_global_num_tokens - self.q_lens_list[-1]
-            if fake_tokens > 0:
+            if len(self.q_lens_list) == 1:
+                fake_tokens_and_last_query_tokens = forward_batch.global_num_tokens_cpu[
+                    0
+                ]
+            else:
+                fake_tokens_and_last_query_tokens = (
+                    forward_batch.global_num_tokens_cpu[0] - self.q_lens_list[-2]
+                )
+
+            if fake_tokens_and_last_query_tokens > 0:
                 # todo (zyj) TND QS of each batch computed by actual_seq_lengths should be in range [0, 16]
-                self.q_lens_list.append(align_global_num_tokens)
-                self.kv_lens_list.append(0)
-            self.block_kv_indices = self.block_kv_indices[: len(self.q_lens_list)]
+                if fake_tokens_and_last_query_tokens <= 16:
+                    self.q_lens_list[-1] = forward_batch.global_num_tokens_cpu[0]
+                else:
+                    self.q_lens_list.append(forward_batch.global_num_tokens_cpu[0])
+                    self.kv_lens_list.append(0)
+                    self.block_kv_indices = F.pad(
+                        self.block_kv_indices, (0, 0, 0, 1), mode="constant", value=0
+                    )
         elif forward_batch.global_num_tokens_for_logprob_cpu is not None:
             self.kv_lens_list = copy.copy(self.q_lens_list)
             self.q_lens_list = list(range(1, len(self.q_lens_list) + 1))
@@ -189,6 +201,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
         )
         max_total_tokens = model_runner.server_args.max_total_tokens or MAX_SEQ_LEN
         self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
+        self.graph_metadata = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if (
@@ -196,13 +209,17 @@ class NpuMLABackend(TorchNativeAttnBackend):
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend()
         ):
-            bs = forward_batch.input_ids.size(0)
-            block_kv_indices = torch.full(
-                (bs, self.max_seqlen_pad),
-                -1,
-                dtype=torch.int32,
-                device=forward_batch.seq_lens.device,
-            )
+            bs = forward_batch.seq_lens_cpu.size(0)
+            if bs in self.graph_metadata:
+                block_kv_indices = self.graph_metadata[bs]
+                block_kv_indices.fill_(-1)
+            else:
+                block_kv_indices = torch.full(
+                    (bs, self.max_seqlen_pad),
+                    -1,
+                    dtype=torch.int32,
+                    device=forward_batch.seq_lens.device,
+                )
             create_npumla_kv_indices(
                 forward_batch.batch_size,
                 self.req_to_token,
@@ -233,7 +250,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
     def init_cuda_graph_state(
         self,
         max_bs: int,
-        block_kv_indices: Optional[torch.Tensor] = None,
+        max_num_tokens: int,
     ):
         pass
 
@@ -248,7 +265,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
         spec_info: Optional[SpecInfo],
         forward_batch: ForwardBatch,
     ):
-        self.forward_metadata = NpuMLAMetadata(
+        metadata = NpuMLAMetadata(
             torch.full(
                 (bs, self.max_seqlen_pad),
                 0,
@@ -258,6 +275,8 @@ class NpuMLABackend(TorchNativeAttnBackend):
             [1] * bs,
             forward_batch,
         )
+        self.graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -270,7 +289,8 @@ class NpuMLABackend(TorchNativeAttnBackend):
         spec_info: Optional[SpecInfo],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        pass
+        if bs in self.graph_metadata:
+            self.forward_metadata = self.graph_metadata[bs]
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0

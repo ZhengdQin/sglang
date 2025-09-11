@@ -853,7 +853,9 @@ def assign_req_to_token_pool_native(
     src_indices = torch.repeat_interleave(cumsum_lengths, lengths) + offsets
 
     token_pool = req_to_token[req_pool_indices]
-    token_pool[row_indices, col_indices] = out_cache_loc[src_indices]
+    token_pool[row_indices, col_indices] = out_cache_loc[src_indices].to(
+        token_pool.dtype
+    )
     req_to_token[req_pool_indices] = token_pool
 
 

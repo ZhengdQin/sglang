@@ -831,7 +831,7 @@ class DeepseekV2MoE(nn.Module):
         hidden_states = state.hidden_states_mlp_input
 
         if router_logits is not None:
-            with get_global_expert_distribution_recorder(_is_npu).with_current_layer(
+            with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
                 state.topk_weights_local, state.topk_idx_local, _ = self.topk(
@@ -862,7 +862,7 @@ class DeepseekV2MoE(nn.Module):
 
     def op_dispatch_b(self, state):
         if self.ep_size > 1:
-            with get_global_expert_distribution_recorder(_is_npu).with_current_layer(
+            with get_global_expert_distribution_recorder().with_current_layer(
                 self.layer_id
             ):
                 state.dispatch_output = self.experts.deepep_dispatcher.dispatch_b(
@@ -1444,7 +1444,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            forward_batch.out_cache_loc.to(torch.int64),
+            forward_batch.out_cache_loc,
             value_cache,
             key_cache,
             k_rope_scale=None,
@@ -1600,7 +1600,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin)  # (B,N,S,D)
         q_pe = q_pe.view(cos.shape[0], self.num_local_heads, self.qk_rope_head_dim)
 
-        tmp_slot_mapping = forward_batch.out_cache_loc
         latent_cache = latent_cache.view(
             -1, 1, 1, self.kv_lora_rank + self.qk_rope_head_dim
         )  # (B*S,N,1,D)
@@ -1626,7 +1625,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.kv_a_layernorm.weight,
             cos,
             sin,
-            tmp_slot_mapping.to(torch.int64),
+            forward_batch.out_cache_loc,
             rope_cache,
             nope_cache,
             epsilon=self.kv_a_layernorm.variance_epsilon,
@@ -2460,7 +2459,7 @@ class DeepseekV2Model(nn.Module):
             else total_num_layers
         )
         for i in range(normal_num_layers):
-            with get_global_expert_distribution_recorder(_is_npu).with_current_layer(i):
+            with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 if (
                     _is_npu

@@ -273,6 +273,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
+            extend_seq_lens_cpu=torch.full((bs,), self.num_tokens_per_bs),
             next_token_logits_buffer=next_token_logits_buffer,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
@@ -280,6 +281,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
             positions=positions,
+            global_num_tokens_cpu=self.global_num_tokens_gpu.cpu().tolist(),
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DPPaddingMode.get_default_mode_in_cuda_graph(),
@@ -291,7 +293,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             extend_seq_lens=extend_seq_lens,
             padded_static_len=self.padded_static_len,
         )
-
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             num_tokens=num_tokens,
@@ -300,6 +301,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             encoder_lens=None,
             forward_mode=ForwardMode.DRAFT_EXTEND,
             spec_info=spec_info,
+            forward_batch=forward_batch,
         )
 
         # Run and capture

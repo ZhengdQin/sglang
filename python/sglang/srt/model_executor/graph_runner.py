@@ -639,6 +639,7 @@ class GraphRunner:
             encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            forward_batch,
         )
 
         # Run and capture

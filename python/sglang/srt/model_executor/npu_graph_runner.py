@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import bisect
 import inspect
 import logging
 import os
@@ -33,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     PPProxyTensors,
+    enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.graph_runner import GraphRunner
 from sglang.srt.utils import get_available_gpu_memory, get_compiler_backend
@@ -48,11 +50,16 @@ class NPUGraphRunner(GraphRunner):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        if self.enable_torch_compile:
-            self.enable_cache = os.getenv("ENABLE_TORCH_COMPILE_CACHE", "0") == "1"
-            self.warm_up()
+        if model_runner.is_draft_worker:
+            pass
         else:
-            super().warm_up()
+            if self.enable_torch_compile:
+                self.enable_cache = os.getenv("ENABLE_TORCH_COMPILE_CACHE", "0") == "1"
+                self.warm_up()
+            elif (
+                not model_runner.server_args.disable_cuda_graph
+            ):  # todo (wangq) support aclgraph in main model
+                super().warm_up()
 
     def _create_device_graph(self):
         return torch.npu.NPUGraph()
@@ -81,33 +88,131 @@ class NPUGraphRunner(GraphRunner):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
-        else:
-            # In speculative decoding, these two fields are still needed.
-            self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+        if self.enable_torch_compile:
+            # pad, similar with replay_prepare
+            raw_bs = forward_batch.batch_size
+            max_num_tokens = max(forward_batch.global_num_tokens_cpu)
+            if self.require_mlp_tp_gather:
+                max_batch_size = (
+                    max_num_tokens / self.num_tokens_per_bs
+                    if self.model_runner.spec_algorithm.is_eagle()
+                    else max_num_tokens
+                )
+                index = bisect.bisect_left(self.capture_bs, max_batch_size)
+            else:
+                index = bisect.bisect_left(self.capture_bs, raw_bs)
+            bs = self.capture_bs[index]
+            if bs != raw_bs:
+                forward_batch.seq_lens = forward_batch._pad_tensor_to_size(
+                    forward_batch.seq_lens, bs, value=self.seq_len_fill_value
+                )
+                forward_batch.seq_lens_cpu = forward_batch._pad_tensor_to_size(
+                    forward_batch.seq_lens_cpu, bs, value=self.seq_len_fill_value
+                )
+                forward_batch.extend_seq_lens = forward_batch._pad_tensor_to_size(
+                    forward_batch.extend_seq_lens, bs, value=self.seq_len_fill_value
+                )
+            num_token = bs * self.num_tokens_per_bs
+            if num_token != max_num_tokens:
+                forward_batch.input_ids = forward_batch._pad_tensor_to_size(
+                    forward_batch.input_ids, num_token
+                )
+                forward_batch.out_cache_loc = forward_batch._pad_tensor_to_size(
+                    forward_batch.out_cache_loc, num_token
+                )
+                forward_batch.positions = forward_batch._pad_tensor_to_size(
+                    forward_batch.positions, num_token
+                )
+                forward_batch.req_pool_indices = forward_batch._pad_tensor_to_size(
+                    forward_batch.req_pool_indices, bs
+                )
+                forward_batch.gathered_buffer = torch.zeros(
+                    (num_token, self.model_runner.model_config.hidden_size),
+                    dtype=self.model_runner.dtype,
+                    device=self.model_runner.device,
+                )
+            # NPU need start
+            if (
+                forward_batch.extend_seq_lens_cpu is not None
+                and len(forward_batch.extend_seq_lens_cpu) != bs
+            ):
+                forward_batch.extend_seq_lens_cpu += [self.seq_len_fill_value] * (
+                    bs - len(forward_batch.extend_seq_lens_cpu)
+                )
+            if forward_batch.extend_logprob_start_lens_cpu is not None:
+                l = len(forward_batch.extend_logprob_start_lens_cpu)
+                if l < bs:
+                    forward_batch.extend_logprob_start_lens_cpu += [
+                        self.seq_len_fill_value
+                    ] * (bs - l)
+                elif l > bs:
+                    forward_batch.extend_logprob_start_lens_cpu = (
+                        forward_batch.extend_logprob_start_lens_cpu[:bs]
+                    )
 
-        # Replay
-        seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (self.bs - self.raw_bs)
-        thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
-        thread.start()
-        self.graphs[self.bs].replay()
-        thread.join()
+            forward_batch.attn_backend.init_forward_metadata(forward_batch)
+            # NPU need end
 
-        output = self.output_buffers[self.bs]
-        if isinstance(output, LogitsProcessorOutput):
-            return LogitsProcessorOutput(
-                next_token_logits=output.next_token_logits[: self.raw_num_token],
-                hidden_states=(
-                    output.hidden_states[: self.raw_num_token]
-                    if output.hidden_states is not None
-                    else None
-                ),
+            kwargs = {}
+            if pp_proxy_tensors is not None:
+                kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
+            compile_method_name = f"compile_forward_{forward_batch.input_ids.size(0)}bs"
+            compile_forward = (
+                getattr(self.model_runner.model, compile_method_name)
+                if self.enable_cache
+                else self.model_runner.model.compile_forward
             )
+            with torch.no_grad():
+                return compile_forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
+
         else:
-            assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            if not skip_attn_backend_init:
+                self.replay_prepare(forward_batch, pp_proxy_tensors)
+            else:
+                # In speculative decoding, these two fields are still needed.
+                self.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+                self.positions[: self.raw_num_token].copy_(forward_batch.positions)
+
+            # Replay
+            seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                self.bs - self.raw_bs
+            )
+            if self.capture_forward_mode.is_target_verify():
+                if self.bs != len(forward_batch.extend_seq_lens_cpu):
+                    forward_batch.extend_seq_lens_cpu += [0] * (
+                        self.bs - len(forward_batch.extend_seq_lens_cpu)
+                    )
+                if self.bs != len(forward_batch.extend_logprob_start_lens_cpu):
+                    forward_batch.extend_logprob_start_lens_cpu += [0] * (
+                        self.bs - len(forward_batch.extend_logprob_start_lens_cpu)
+                    )
+
+            thread = threading.Thread(target=self._update_inputs, args=(seq_lens,))
+            thread.start()
+            self.graphs[self.bs].replay()
+            thread.join()
+
+            output = self.output_buffers[self.bs]
+            if isinstance(output, LogitsProcessorOutput):
+                return LogitsProcessorOutput(
+                    next_token_logits=output.next_token_logits[: self.raw_num_token],
+                    hidden_states=(
+                        output.hidden_states[: self.raw_num_token]
+                        if output.hidden_states is not None
+                        else None
+                    ),
+                )
+            else:
+                assert isinstance(output, PPProxyTensors)
+                return PPProxyTensors(
+                    {k: v[: self.bs] for k, v in output.tensors.items()}
+                )
 
     def prepare_forward_batch(self, bs: int, num_tokens: int) -> ForwardBatch:
         # Graph inputs
@@ -121,7 +226,7 @@ class NPUGraphRunner(GraphRunner):
             input_ids = torch.zeros((num_tokens,), dtype=torch.int64)
             req_pool_indices = torch.zeros((bs,), dtype=torch.int64)
             seq_lens = torch.full((bs,), self.seq_len_fill_value, dtype=torch.int64)
-            out_cache_loc = torch.zeros((num_tokens,), dtype=torch.int32)
+            out_cache_loc = torch.zeros((num_tokens,), dtype=torch.int64)
             positions = torch.zeros((num_tokens,), dtype=torch.int64)
             gathered_buffer = None
             if self.require_gathered_buffer:
@@ -133,6 +238,16 @@ class NPUGraphRunner(GraphRunner):
                     dtype=self.model_runner.dtype,
                 )
             num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32)
+            if self.capture_forward_mode.is_target_verify():
+                extend_seq_lens = torch.full(
+                    (bs,), self.seq_len_fill_value, dtype=torch.int32
+                )
+                extend_seq_lens_cpu = extend_seq_lens.cpu().tolist()
+                extend_logprob_start_lens_cpu = [0] * bs
+            else:
+                extend_seq_lens = None
+                extend_seq_lens_cpu = None
+                extend_logprob_start_lens_cpu = None
 
         if self.is_encoder_decoder:
             encoder_lens = self.encoder_lens[:bs]
@@ -200,9 +315,13 @@ class NPUGraphRunner(GraphRunner):
             global_num_tokens_cpu=global_num_tokens_cpu,
             global_num_tokens_for_logprob_cpu=global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens.clone(),
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_logprob_start_lens_cpu=extend_logprob_start_lens_cpu,
             can_run_graph=True,
             dp_padding_mode=dp_padding_mode,
         )
+        # todo
         return forward_batch
 
     def warm_up(self):
@@ -237,7 +356,7 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
                     empty_cache=False,
                 )
                 compile_range.set_description(
-                    f"Capturing batches ({avail_mem=:.2f} GB)"
+                    f"Capturing batches ({bs=}, {avail_mem=:.2f} GB)"
                 )
             num_tokens = bs * self.num_tokens_per_bs
             forward_batch = self.prepare_forward_batch(bs, num_tokens)
@@ -328,8 +447,17 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
         mark_tensor_static(forward_batch.input_embeds)
         mark_tensor_static(forward_batch.out_cache_loc)
         mark_tensor_static(forward_batch.gathered_buffer)
-        mark_tensor_static(forward_batch.attn_backend.forward_metadata.block_kv_indices)
-        mark_tensor_static(forward_batch.attn_backend.forward_metadata.mc2_mask)
+        mark_tensor_static(forward_batch.input_embeds)
+        mark_tensor_static(forward_batch.out_cache_loc)
+        mark_tensor_static(forward_batch.next_token_logits_buffer)
+        mark_tensor_static(forward_batch.extend_seq_lens)
+        if hasattr(forward_batch.attn_backend, "forward_metadata"):
+            mark_tensor_static(
+                forward_batch.attn_backend.forward_metadata.block_kv_indices
+            )
+            mark_tensor_static(forward_batch.attn_backend.forward_metadata.mc2_mask)
+        if hasattr(forward_batch.spec_info, "hidden_status"):
+            mark_tensor_static(forward_batch.spec_info.hidden_status)
         try:
             mark_tensor_static(forward_batch.token_to_kv_pool.k_buffer, is_cache=True)
             mark_tensor_static(forward_batch.token_to_kv_pool.v_buffer, is_cache=True)
@@ -343,45 +471,17 @@ def {method_name}(self, input_ids, positions, forward_batch, **kwargs):
         skip_attn_backend_init: bool,
     ) -> Generator[Callable[[bool, PPProxyTensors | None], Any], Any, None]:
         def runner_fn(pp_proxy_tensors: Optional[PPProxyTensors]):
-            if self.enable_torch_compile:
-                kwargs = {}
-                if pp_proxy_tensors is not None:
-                    kwargs["pp_proxy_tensors"] = pp_proxy_tensors
 
-                compile_method_name = (
-                    f"compile_forward_{forward_batch.input_ids.size(0)}bs"
-                )
-                compile_forward = (
-                    getattr(self.model_runner.model, compile_method_name)
-                    if self.enable_cache
-                    else self.model_runner.model.compile_forward
-                )
-                with torch.no_grad():
-                    return compile_forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
-                    )
-            else:
-                return self.replay(
-                    forward_batch, skip_attn_backend_init, pp_proxy_tensors
-                )
+            return self.replay(forward_batch, skip_attn_backend_init, pp_proxy_tensors)
 
-        if not skip_attn_backend_init:
-            forward_batch.attn_backend.init_forward_metadata(forward_batch)
+        # if not skip_attn_backend_init:
+        #     forward_batch.attn_backend.init_forward_metadata(forward_batch)
         yield runner_fn
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if forward_batch.dp_padding_mode == DPPaddingMode.MAX_LEN:
-            return bool(
-                self.enable_torch_compile
-                and forward_batch.batch_size in self.compile_bs
-                and not forward_batch.is_extend_in_batch
-                and len(set(forward_batch.global_num_tokens_for_logprob_cpu)) == 1
-            )
         return bool(
-            forward_batch.forward_mode.is_decode()
-            and self.enable_torch_compile
-            and forward_batch.batch_size in self.compile_bs
+            self.enable_torch_compile
+            and forward_batch.forward_mode.is_cuda_graph()
+            and forward_batch.batch_size <= max(self.compile_bs)
+            and len(set(forward_batch.global_num_tokens_for_logprob_cpu)) == 1
         )
