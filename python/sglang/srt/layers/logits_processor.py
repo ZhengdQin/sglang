@@ -520,7 +520,9 @@ class LogitsProcessor(nn.Module):
 
         if self.do_tensor_parallel_all_gather_dp_attn:
             if logits_metadata.can_run_graph:
-                global_logits = logits.view(self.dp_size, -1, logits.size(-1))
+                global_logits = logits.view(
+                    -1, local_hidden_states.shape[0], logits.shape[1]
+                )
                 logits = global_logits[self.dp_rank]
             else:
                 logits, global_logits = (
