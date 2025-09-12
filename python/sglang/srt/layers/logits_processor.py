@@ -173,6 +173,7 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DPPaddingMode.SUM_LEN,
             is_extend_in_batch=forward_batch.is_extend_in_batch,
+            can_run_graph=forward_batch.can_run_graph,
         )
 
     def compute_dp_attention_metadata(self):
@@ -202,13 +203,6 @@ class LogitsMetadata:
             )
         else:
             self.gathered_buffer = torch.empty_like(self.gathered_buffer)
-
-        self.can_run_graph = False
-        if (
-            len(set(self.global_num_tokens_for_logprob_cpu)) == 1
-            and not self.is_extend_in_batch
-        ):
-            self.can_run_graph = True
 
 
 class LogitsProcessor(nn.Module):
