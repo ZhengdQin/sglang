@@ -1001,7 +1001,7 @@ class _DeepEPDispatcherImplNpu:
             "expand_x": hidden_states,
             "expert_ids": topk_ids,
             "assist_info_for_combine": topk_idx,
-            "expert_scales": topk_weights.to(torch.float32),
+            "expert_scales": topk_weights,
             "expert_shard_type": 0,
             "shared_expert_x": shared_output,
             "shared_expert_rank_num": self.shared_expert_rank_num,

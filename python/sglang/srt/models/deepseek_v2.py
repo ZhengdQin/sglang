@@ -289,7 +289,7 @@ class MoEGate(nn.Module):
             # router gemm output float32
             logits = dsv3_router_gemm(hidden_states, self.weight)
         else:
-            logits = F.linear(hidden_states, self.weight, None)
+            logits = F.linear(hidden_states.to(torch.float32), self.weight, None)
 
         return logits
 
