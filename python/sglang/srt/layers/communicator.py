@@ -22,6 +22,7 @@ import torch.distributed
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
@@ -547,9 +548,13 @@ class CommunicateSummableTensorPairFn:
         # TODO(ch-wan): use reduce-scatter in MLP to avoid this scatter
         # important: forward batch.gathered_buffer is used both after scatter and after gather.
         # be careful about this!
-        if 0:  # get_attention_dp_size() == get_tensor_model_parallel_world_size():
-            # TODO: has precision problems
-            # when dp_size == world size, there is no need to do scatter and allgather
+        if get_attention_dp_size() == get_tensor_model_parallel_world_size():
+            # when dp_size == world size, there is no need to do all_reduce + scatter, we can use reduce-scatter instead.
+            hidden_states, local_hidden_states = (
+                forward_batch.scattered_buffer,
+                hidden_states,
+            )
+            tensor_model_parallel_reduce_scatter(hidden_states, local_hidden_states)
             return hidden_states, residual
         else:
             hidden_states, global_hidden_states = (

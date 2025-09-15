@@ -237,6 +237,15 @@ class NPUGraphRunner(GraphRunner):
                     ),
                     dtype=self.model_runner.dtype,
                 )
+                if self.tp_size == self.dp_size:
+                    # Here tp_size and dp_size are from augments, so tp_size == dp_size means attention tp size is 1
+                    scattered_buffer = torch.zeros(
+                        (
+                            num_tokens,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
             num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32)
             if self.capture_forward_mode.is_target_verify():
                 extend_seq_lens = torch.full(
@@ -304,6 +313,7 @@ class NPUGraphRunner(GraphRunner):
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
             gathered_buffer=gathered_buffer,
+            scattered_buffer=scattered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
