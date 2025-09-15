@@ -911,11 +911,18 @@ class EAGLEWorker(TpModelWorker):
 
         batch.return_hidden_states = False
         model_worker_batch = batch.get_model_worker_batch()
+        if not self.server_args.enable_dp_attention:  # todo (zyj)
+            model_worker_batch.global_num_tokens[0] = (
+                model_worker_batch.req_pool_indices.numel()
+            )
+            model_worker_batch.global_num_tokens_for_logprob[0] = (
+                model_worker_batch.global_num_tokens[0]
+            )
+
         assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        forward_batch.global_num_tokens_cpu = [forward_batch.extend_num_tokens]
         if forward_batch.seq_lens_cpu is not None:
             forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
         else:
@@ -926,6 +933,7 @@ class EAGLEWorker(TpModelWorker):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
+        forward_batch.can_run_graph = can_cuda_graph
         if can_cuda_graph:
             logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch

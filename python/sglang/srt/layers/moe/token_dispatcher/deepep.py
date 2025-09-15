@@ -785,7 +785,6 @@ class _DeepEPDispatcherImplNpu:
                 self.n_shared_experts * self.experts_share_num_copy
             )
             self.num_experts -= self.shared_expert_rank_num  # todo
-        self.mc2_mask = None
 
     def dispatch(
         self,
@@ -798,20 +797,11 @@ class _DeepEPDispatcherImplNpu:
         if forward_batch.is_extend_in_batch:
             return self.dispatch_prefill(hidden_states, topk_idx)
         else:
-            if forward_batch.attn_backend.forward_metadata is None:
-                self.mc2_mask = None
-            else:
-                self.mc2_mask = forward_batch.attn_backend.forward_metadata.mc2_mask
-            if self.mc2_mask is not None:
-                bs_qlen = hidden_states.shape[0]
-                if self.dps_size == self.world_size:
-                    # Every NPU has an mc_mask when dp_size == world_size
-                    self.mc2_mask = self.mc2_mask[:bs_qlen]
-                else:
-                    self.mc2_mask = self.mc2_mask[
-                        self.global_rank * bs_qlen : (self.global_rank + 1) * bs_qlen
-                    ]
-            return self.dispatch_decode(hidden_states, topk_idx, self.mc2_mask)
+            return self.dispatch_decode(
+                hidden_states,
+                topk_idx,
+                forward_batch.attn_backend.forward_metadata.mc2_mask,
+            )
 
     def dispatch_prefill(self, hidden_states, topk_ids) -> Tuple:
         expanded_x, expanded_row_idx, tokens_per_expert, pertoken_scale = (
@@ -951,7 +941,7 @@ class _DeepEPDispatcherImplNpu:
                 ep_send_counts,
                 tp_send_counts,
                 shared_output,
-                self.mc2_mask,
+                forward_batch.attn_backend.forward_metadata.mc2_mask,
             )
 
     def combine_prefill(

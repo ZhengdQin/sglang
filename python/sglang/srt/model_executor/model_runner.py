@@ -1638,6 +1638,8 @@ class ModelRunner:
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
     ) -> LogitsProcessorOutput:
+        if _is_npu:
+            self.attn_backend.init_forward_metadata(forward_batch, skip_fa=True)
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors

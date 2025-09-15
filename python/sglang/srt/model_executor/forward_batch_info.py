@@ -599,6 +599,8 @@ class ForwardBatch:
             self.prefix_chunk_kv_indices.append(chunk_kv_indices)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+        if size <= tensor.shape[0]:
+            return tensor
         if value == 0:
             return torch.cat(
                 [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],

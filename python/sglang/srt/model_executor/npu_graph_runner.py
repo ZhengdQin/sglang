@@ -109,9 +109,10 @@ class NPUGraphRunner(GraphRunner):
                 forward_batch.seq_lens_cpu = forward_batch._pad_tensor_to_size(
                     forward_batch.seq_lens_cpu, bs, value=self.seq_len_fill_value
                 )
-                forward_batch.extend_seq_lens = forward_batch._pad_tensor_to_size(
-                    forward_batch.extend_seq_lens, bs, value=self.seq_len_fill_value
-                )
+                if forward_batch.extend_seq_lens is not None:
+                    forward_batch.extend_seq_lens = forward_batch._pad_tensor_to_size(
+                        forward_batch.extend_seq_lens, bs, value=self.seq_len_fill_value
+                    )
             num_token = bs * self.num_tokens_per_bs
             if num_token != max_num_tokens:
                 forward_batch.input_ids = forward_batch._pad_tensor_to_size(

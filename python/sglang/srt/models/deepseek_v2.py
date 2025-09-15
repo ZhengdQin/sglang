@@ -223,7 +223,12 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(
-        self, x, forward_batch=None, can_fuse_mlp_allreduce=False, dynamic_scale=None
+        self,
+        x,
+        forward_batch=None,
+        can_fuse_mlp_allreduce=False,
+        dynamic_scale: Optional[torch.Tensor] = None,
+        expert_tokens: Optional[torch.Tensor] = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
@@ -234,6 +239,7 @@ class DeepseekV2MLP(nn.Module):
                 weight_scale=self.gate_up_proj.weight_scale.data,
                 activation_scale=dynamic_scale,
                 quant_scale=None,
+                group_index=expert_tokens,
                 activate_left=True,
                 quant_mode=1,
             )
@@ -760,7 +766,7 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             final_hidden_states = self._forward_shared_experts(
-                hidden_states, dynamic_scale=dynamic_scale
+                hidden_states, dynamic_scale=dynamic_scale, expert_tokens=None
             )
         if self.ep_size > 1:
             if (
@@ -804,9 +810,9 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states
 
-    def _forward_shared_experts(self, hidden_states, dynamic_scale=None):
+    def _forward_shared_experts(self, hidden_states, **kwargs):
         if self.num_fused_shared_experts == 0:
-            return self.shared_experts(hidden_states, dynamic_scale=dynamic_scale)
+            return self.shared_experts(hidden_states, **kwargs)
         else:
             return None
 

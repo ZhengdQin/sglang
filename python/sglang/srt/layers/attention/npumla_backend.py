@@ -22,6 +22,7 @@ from sglang.srt.layers.dp_attention import (
     DPPaddingMode,
     get_attention_dp_rank,
     get_attention_dp_size,
+    get_attention_tp_rank,
     get_attention_tp_size,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -48,7 +49,12 @@ class NpuMLAMetadata:
         block_kv_indices: Optional[torch.Tensor] = None,
         seq_lens_list=None,
         forward_batch: ForwardBatch = None,
+        skip_fa: bool = False,
     ):
+        if skip_fa:
+            self.init_mc2_mask(forward_batch)
+            return
+
         self.block_kv_indices = block_kv_indices
         self.q_lens_list = seq_lens_list or [1]
 
@@ -56,13 +62,11 @@ class NpuMLAMetadata:
             forward_batch.forward_mode == ForwardMode.EXTEND
             or forward_batch.global_num_tokens_cpu is None
         ):
-            tp_size = get_attention_tp_size()
             self.kv_lens_list = np.cumsum(self.q_lens_list).tolist()
             if forward_batch.dp_padding_mode == DPPaddingMode.MAX_LEN:
-                # DPPaddingMode.MAX_LEN
                 self.kv_lens_list[-1] = forward_batch.input_ids.size(0)
-            else:
-                # DPPaddingMode.SUM_LEN
+            else:  # DPPaddingMode.SUM_LEN
+                tp_size = get_attention_tp_size()
                 self.kv_lens_list[-1] = (
                     (self.kv_lens_list[-1] - 1) // tp_size + 1
                 ) * tp_size
@@ -78,51 +82,93 @@ class NpuMLAMetadata:
                 )
             )
             if forward_batch.dp_padding_mode is not None:
-                fake_tokens = (
-                    forward_batch.global_num_tokens_cpu[0] - self.q_lens_list[-1]
-                )
-                if fake_tokens > 0:
-                    self.q_lens_list[-1] = forward_batch.global_num_tokens_cpu[0]
-
-            # self.block_kv_indices = self.block_kv_indices[
-            #     : len(self.q_lens_list)
-            # ].clone()
+                self.pad_qk_lens_list(forward_batch.global_num_tokens_cpu)
         elif forward_batch.forward_mode.is_draft_extend():
             tp_size = get_attention_tp_size()
             self.kv_lens_list = self.q_lens_list
             self.q_lens_list = np.cumsum(forward_batch.extend_seq_lens_cpu).tolist()
-            if len(self.q_lens_list) == 1:
-                fake_tokens_and_last_query_tokens = forward_batch.global_num_tokens_cpu[
-                    0
-                ]
-            else:
-                fake_tokens_and_last_query_tokens = (
-                    forward_batch.global_num_tokens_cpu[0] - self.q_lens_list[-2]
-                )
-
-            if fake_tokens_and_last_query_tokens > 0:
-                # todo (zyj) TND QS of each batch computed by actual_seq_lengths should be in range [0, 16]
-                if fake_tokens_and_last_query_tokens <= 16:
-                    self.q_lens_list[-1] = forward_batch.global_num_tokens_cpu[0]
-                else:
-                    self.q_lens_list.append(forward_batch.global_num_tokens_cpu[0])
-                    self.kv_lens_list.append(0)
-                    self.block_kv_indices = F.pad(
-                        self.block_kv_indices, (0, 0, 0, 1), mode="constant", value=0
-                    )
-        elif forward_batch.global_num_tokens_for_logprob_cpu is not None:
+            if forward_batch.dp_padding_mode is not None:
+                self.pad_qk_lens_list(forward_batch.global_num_tokens_cpu)
+        elif forward_batch.global_num_tokens_for_logprob_cpu is not None:  # DECODE
             self.kv_lens_list = copy.copy(self.q_lens_list)
             self.q_lens_list = list(range(1, len(self.q_lens_list) + 1))
-            vaild_batch = forward_batch.global_num_tokens_for_logprob_cpu[
-                get_attention_dp_rank()
-            ]
-            assert vaild_batch <= forward_batch.batch_size
-            self.mc2_mask = torch.zeros(
-                forward_batch.batch_size,
+
+        self.init_mc2_mask(forward_batch)
+
+    def init_mc2_mask(self, forward_batch: ForwardBatch):
+        dp_size = get_attention_dp_size()
+        dp_rank = get_attention_dp_rank()
+        tp_size = get_attention_tp_size()
+        tp_rank = get_attention_tp_rank()
+
+        def create_mask(vaild_tokens, max_bs_qlen):
+            mc2_mask = torch.zeros(
+                max_bs_qlen,
                 dtype=torch.bool,
-                device=block_kv_indices.device,
+                device=forward_batch.input_ids.device,
             )
-            self.mc2_mask[:vaild_batch].fill_(True)
+            if vaild_tokens > 0:
+                assert vaild_tokens <= max_bs_qlen
+                mc2_mask[:vaild_tokens].fill_(True)
+            if dp_size > 1:
+                pass
+            else:
+                mc2_mask = mc2_mask.tensor_split(tp_size)[tp_rank]
+
+        if (
+            forward_batch.forward_mode == ForwardMode.EXTEND
+            or forward_batch.global_num_tokens_cpu is None
+        ):
+            return
+        elif forward_batch.forward_mode.is_target_verify():
+            draft_token_num = forward_batch.spec_info.draft_token_num
+            vaild_bs = forward_batch.batch_size
+            vaild_tokens = vaild_bs * draft_token_num
+        elif forward_batch.forward_mode.is_draft_extend():
+            vaild_tokens = sum(forward_batch.extend_seq_lens_cpu)
+        elif (
+            forward_batch.global_num_tokens_for_logprob_cpu is not None
+        ):  # DECODE or IDLE
+            vaild_tokens = forward_batch.global_num_tokens_for_logprob_cpu[dp_rank]
+            if forward_batch.spec_info is not None and hasattr(
+                forward_batch.spec_info, "num_tokens_per_batch"
+            ):
+                vaild_tokens = (
+                    vaild_tokens * forward_batch.spec_info.num_tokens_per_batch
+                )
+        else:
+            raise ValueError(f"unsupported forward mode {forward_batch.forward_mode}")
+        max_bs_qlen = max(forward_batch.global_num_tokens_cpu)
+        self.mc2_mask = create_mask(vaild_tokens, max_bs_qlen)
+
+    def pad_qk_lens_list(self, global_num_tokens_cpu):
+        dp_rank = get_attention_dp_rank()
+        if len(self.q_lens_list) == 1:
+            fake_tokens_and_last_query_tokens = global_num_tokens_cpu[dp_rank]
+        else:
+            fake_tokens_and_last_query_tokens = (
+                global_num_tokens_cpu[dp_rank] - self.q_lens_list[-2]
+            )
+
+        if fake_tokens_and_last_query_tokens > 0:
+            # todo (zyj) TND QS of each batch computed by actual_seq_lengths should be in range [0, 16]
+            if fake_tokens_and_last_query_tokens <= 16:
+                self.q_lens_list[-1] = global_num_tokens_cpu[dp_rank]
+            else:
+                append_list = list(
+                    range(self.q_lens_list[-1], global_num_tokens_cpu[dp_rank] + 1, 16)
+                )
+                if append_list[-1] < global_num_tokens_cpu[dp_rank]:
+                    append_list.append(global_num_tokens_cpu[dp_rank])
+                append_list = append_list[1:]
+                self.q_lens_list.extend(append_list)
+                self.kv_lens_list.extend([0] * len(append_list))
+                self.block_kv_indices = F.pad(
+                    self.block_kv_indices,
+                    (0, 0, 0, len(append_list)),
+                    mode="constant",
+                    value=0,
+                )
 
 
 def create_npumla_kv_indices(
@@ -203,7 +249,11 @@ class NpuMLABackend(TorchNativeAttnBackend):
         self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
         self.graph_metadata = {}
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_metadata(self, forward_batch: ForwardBatch, skip_fa: bool = False):
+        if skip_fa:
+            self.forward_metadata = NpuMLAMetadata(None, None, forward_batch, True)
+            return
+
         if (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()

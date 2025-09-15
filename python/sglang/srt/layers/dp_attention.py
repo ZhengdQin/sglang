@@ -18,6 +18,8 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.utils import is_npu
 
+_is_npu = is_npu()
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -286,9 +288,16 @@ def _dp_gather_via_all_reduce(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
-        memcpy_triton(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
-        )
+
+        if _is_npu:
+            # there is a  MTE out of address bug in memcpy_triton when device is npu
+            memcpy_npu(
+                global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+            )
+        else:
+            memcpy_triton(
+                global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+            )
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -368,9 +377,16 @@ def dp_scatter(
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
-        memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
-        )
+
+        if _is_npu:
+            # there is a  MTE out of address bug in memcpy_triton when device is npu
+            memcpy_npu(
+                local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            )
+        else:
+            memcpy_triton(
+                local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
+            )
     else:
         raise NotImplementedError("dp_scatter not implemented")
 

@@ -721,7 +721,11 @@ def alloc_extend_native(
     if speculative_num_draft_tokens == 2:
         indices_1 = torch.where(extend_lens == 1)[0]  # no accept
         indices_2 = torch.where(extend_lens == 2)[0]  # accept one token
-    if speculative_num_draft_tokens == 2 and len(indices_1) > 0 and len(indices_2) == 0:
+    if (
+        speculative_num_draft_tokens == 2
+        and len(indices_1) == extend_lens.numel()
+        and len(indices_2) == 0
+    ):
         out_indices = alloc_decode_kernel_ascend(
             seq_lens,
             last_loc,

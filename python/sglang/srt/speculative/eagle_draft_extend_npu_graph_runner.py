@@ -225,10 +225,7 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
         num_tokens = bs * self.num_tokens_per_bs
         if self.require_mlp_tp_gather:
             global_num_tokens_gpu = torch.tensor(
-                [
-                    num_tokens // self.dp_size + (i < (num_tokens % self.dp_size))
-                    for i in range(self.dp_size)
-                ],
+                [num_tokens] * self.dp_size,
                 dtype=torch.int64,
                 device=input_ids.device,
             )
@@ -272,6 +269,7 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             attn_backend=self.eagle_worker.draft_extend_attn_backend,
             extend_seq_lens=extend_seq_lens,
             padded_static_len=self.padded_static_len,
+            can_run_graph=True,
         )
         self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
