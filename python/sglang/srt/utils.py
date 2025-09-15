@@ -214,6 +214,9 @@ try:
 except:
     is_intel_amx_backend_available = False
 
+if is_npu():
+    import torchair
+
 
 def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
@@ -2158,6 +2161,13 @@ class EmptyContextManager:
 
 def empty_context(*args, **kwargs):
     return EmptyContextManager()
+
+
+def npu_stream_switch(switch_flag: bool, stream_tag: str, stream_priority: int = 0):
+    if switch_flag:
+        return torchair.scope.npu_stream_switch(stream_tag, stream_priority)
+    else:
+        return empty_context()
 
 
 def add_prefix(name: str, prefix: str) -> str:

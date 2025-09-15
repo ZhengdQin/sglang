@@ -119,6 +119,7 @@ from sglang.srt.utils import (
     is_non_idle_and_non_empty,
     is_npu,
     log_info_on_rank0,
+    npu_stream_switch,
     use_intel_amx_backend,
 )
 
@@ -701,7 +702,8 @@ class DeepseekV2MoE(nn.Module):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             if self.route_share_on_same_card:
-                shared_output = self._forward_shared_experts(hidden_states)
+                with npu_stream_switch(forward_batch.can_run_graph, "shared_expert"):
+                    shared_output = self._forward_shared_experts(hidden_states)
             topk_weights, topk_idx, _ = self.topk(
                 hidden_states,
                 router_logits,
