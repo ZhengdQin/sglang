@@ -86,7 +86,11 @@ from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
+from sglang.srt.layers.rotary_embedding import (
+    RotaryEmbedding,
+    get_rope,
+    get_rope_wrapper,
+)
 from sglang.srt.layers.utils import is_sm100_supported
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -934,9 +938,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         v_head_dim: int,
         q_lora_rank: int,
         kv_lora_rank: int,
-        rope_theta: float = 10000,
+        rotary_emb: RotaryEmbedding,
         rope_scaling: Optional[Dict[str, Any]] = None,
-        max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         layer_id: int = None,
@@ -959,8 +962,6 @@ class DeepseekV2AttentionMLA(nn.Module):
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
         self.scaling = self.qk_head_dim**-0.5
-        self.rope_theta = rope_theta
-        self.max_position_embeddings = max_position_embeddings
 
         # For tensor parallel attention
         if self.q_lora_rank is not None:
@@ -1026,15 +1027,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope_wrapper(
-            qk_rope_head_dim,
-            rotary_dim=qk_rope_head_dim,
-            max_position=max_position_embeddings,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-            is_neox_style=False,
-            device=global_server_args_dict["device"],
-        )
+        self.rotary_emb = rotary_emb
 
         if rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
@@ -1262,12 +1255,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        **kwargs,
     ):
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            **kwargs,
         )
         return self.forward_core(s)
 
@@ -1277,6 +1272,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        **kwargs,
     ):
         if not _is_npu:
             if self.attn_mha.kv_b_proj is None:
@@ -1306,7 +1302,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         elif attn_forward_method == AttnForwardMethod.MLA:
             if self.npu_use_rope_cache:
                 inner_state = self.forward_absorb_prepare_npu_rms_norm_cache(
-                    positions, hidden_states, forward_batch, zero_allocator
+                    positions, hidden_states, forward_batch, zero_allocator, **kwargs
                 )
             else:
                 inner_state = self.forward_absorb_prepare(
@@ -1571,11 +1567,21 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        **kwargs,
     ):
-        cos_sin = self.rotary_emb.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.repeat(1, 2).unsqueeze(-2)
-        sin = sin.repeat(1, 2).unsqueeze(-2)
+        if (
+            "rope_cos" in kwargs
+            and kwargs["rope_cos"] is not None
+            and "rope_sin" in kwargs
+            and kwargs["rope_sin"] is not None
+        ):
+            cos = kwargs["rope_cos"]
+            sin = kwargs["rope_sin"]
+        else:
+            cos_sin = self.rotary_emb.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            cos = cos.repeat(1, 2).unsqueeze(-2)
+            sin = sin.repeat(1, 2).unsqueeze(-2)
 
         KV_CACHE_NZ_DIM = 16
         if self.q_lora_rank is not None:
@@ -2162,6 +2168,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         config: PretrainedConfig,
         layer_id: int,
+        rotary_emb: RotaryEmbedding,
         quant_config: Optional[QuantizationConfig] = None,
         is_nextn: bool = False,
         prefix: str = "",
@@ -2170,9 +2177,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
-        rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.enable_dp_attention = global_server_args_dict["enable_dp_attention"]
         self.speculative_algorithm = global_server_args_dict["speculative_algorithm"]
         self.layer_id = layer_id
@@ -2188,14 +2193,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                 config.q_lora_rank if hasattr(config, "q_lora_rank") else None
             ),
             kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
             rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
             layer_id=layer_id,
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            rotary_emb=rotary_emb,
         )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
@@ -2292,6 +2296,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            **kwargs,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -2304,6 +2309,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             and not self.is_nextn
         )
 
+        kwargs = {k: v for k, v in kwargs.items() if k not in ["rope_cos", "rope_sin"]}
         hidden_states = self.mlp(
             hidden_states, forward_batch, can_fuse_mlp_allreduce, **kwargs
         )
@@ -2409,6 +2415,24 @@ class DeepseekV2Model(nn.Module):
             enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        rope_theta = config.rope_theta if hasattr(config, "rope_theta") else 10000
+        rope_scaling = config.rope_scaling if hasattr(config, "rope_scaling") else None
+        max_position_embeddings = (
+            config.max_position_embeddings
+            if hasattr(config, "max_position_embeddings")
+            else 8192
+        )
+        if rope_scaling:
+            rope_scaling["rope_type"] = "deepseek_yarn"
+        self.rotary_emb = get_rope_wrapper(
+            config.qk_rope_head_dim,
+            rotary_dim=config.qk_rope_head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=False,
+            device=global_server_args_dict["device"],
+        )
         self.layers = nn.ModuleList(
             [
                 DeepseekV2DecoderLayer(
@@ -2417,6 +2441,7 @@ class DeepseekV2Model(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
+                    rotary_emb=self.rotary_emb,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -2454,6 +2479,13 @@ class DeepseekV2Model(nn.Module):
             device=device,
         )
 
+        cos, sin = None, None
+        if _is_npu:
+            cos_sin = self.rotary_emb.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            cos = cos.repeat(1, 2).unsqueeze(-2)
+            sin = sin.repeat(1, 2).unsqueeze(-2)
+
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -2484,6 +2516,10 @@ class DeepseekV2Model(nn.Module):
                     }
                 else:
                     kwargs = {}
+
+                if _is_npu:
+                    kwargs["rope_cos"] = cos
+                    kwargs["rope_sin"] = sin
 
                 hidden_states, residual = layer(
                     positions,

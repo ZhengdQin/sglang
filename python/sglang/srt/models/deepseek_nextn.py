@@ -26,6 +26,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -67,12 +68,32 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
+        rope_theta = config.rope_theta if hasattr(config, "rope_theta") else 10000
+        rope_scaling = config.rope_scaling if hasattr(config, "rope_scaling") else None
+        max_position_embeddings = (
+            config.max_position_embeddings
+            if hasattr(config, "max_position_embeddings")
+            else 8192
+        )
+        if rope_scaling:
+            rope_scaling["rope_type"] = "deepseek_yarn"
+        self.rotary_emb = get_rope_wrapper(
+            config.qk_rope_head_dim,
+            rotary_dim=config.qk_rope_head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=False,
+            device=global_server_args_dict["device"],
+        )
+
         self.decoder = DeepseekV2DecoderLayer(
             config,
             0,
             quant_config=quant_config,
             is_nextn=True,
             prefix=add_prefix("decoder", prefix),
+            rotary_emb=self.rotary_emb,
         )
 
         self.norm_bias = {}
