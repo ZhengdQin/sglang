@@ -236,6 +236,11 @@ class DeepseekV2MLP(nn.Module):
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
+        attn_tp_size = get_attention_tp_size()
+        if attn_tp_size == 1:
+            # when tp_size == 1 and dp_size > 1, there is no need to do all_reduce + scatter, 
+            # we can use reduce-scatter instead.
+            can_fuse_mlp_allreduce = True
         if _is_npu:
             gate_up, _, dynamic_scale = self.gate_up_proj(x, dynamic_scale, torch.int32)
             down_input, dynamic_scale = torch_npu.npu_dequant_swiglu_quant(

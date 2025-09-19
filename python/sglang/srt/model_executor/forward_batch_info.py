@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
     DPPaddingMode,
     get_attention_dp_rank,
     get_attention_tp_size,
+    get_attention_dp_size,
 )
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
@@ -278,6 +279,7 @@ class ForwardBatch:
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
+    scattered_buffer: Optional[torch.Tensor] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -625,6 +627,7 @@ class ForwardBatch:
         global_num_tokens = self.global_num_tokens_cpu
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_attention_tp_size()
+        attn_dp_size = get_attention_dp_size()
 
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
@@ -650,6 +653,16 @@ class ForwardBatch:
             dtype=model_runner.dtype,
             device=model_runner.device,
         )
+
+        if dp_padding_mode.is_max_len() and attn_tp_size == 1:
+            """If tp size is 1, we can use reduce_scatter instead all_reduce+gather"""
+            self.scattered_buffer = torch.zeros(
+                (buffer_len // attn_dp_size, model_runner.model_config.hidden_size),
+                dtype=model_runner.dtype,
+                device=model_runner.device,
+            )
+        else:
+            self.scattered_buffer = None
 
         if len(global_num_tokens) > 1:
             num_tokens = global_num_tokens[get_attention_dp_rank()]
