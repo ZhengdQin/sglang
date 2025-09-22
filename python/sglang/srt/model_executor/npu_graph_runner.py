@@ -158,7 +158,7 @@ class NPUGraphRunner(GraphRunner):
             if pp_proxy_tensors is not None:
                 kwargs["pp_proxy_tensors"] = pp_proxy_tensors
 
-            compile_method_name = f"compile_forward_{forward_batch.input_ids.size(0)}bs"
+            compile_method_name = f"compile_forward_{bs}bs"
             compile_forward = (
                 getattr(self.model_runner.model, compile_method_name)
                 if self.enable_cache

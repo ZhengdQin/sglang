@@ -130,15 +130,16 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
                 self.forward_batch[bs].spec_info.positions = forward_batch.positions
 
             self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs=bs,
-                req_pool_indices=self.forward_batch[bs].req_pool_indices,
-                seq_lens=self.forward_batch[bs].seq_lens,
-                seq_lens_sum=forward_batch.seq_lens_sum
-                + (bs - raw_bs) * self.seq_len_fill_value,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DRAFT_EXTEND,
-                spec_info=self.forward_batch[bs].spec_info,
-                seq_lens_cpu=self.forward_batch[bs].seq_lens_cpu,
+                self.forward_batch[bs]
+                # bs=bs,
+                # req_pool_indices=self.forward_batch[bs].req_pool_indices,
+                # seq_lens=self.forward_batch[bs].seq_lens,
+                # seq_lens_sum=forward_batch.seq_lens_sum
+                # + (bs - raw_bs) * self.seq_len_fill_value,
+                # encoder_lens=None,
+                # forward_mode=ForwardMode.DRAFT_EXTEND,
+                # spec_info=self.forward_batch[bs].spec_info,
+                # seq_lens_cpu=self.forward_batch[bs].seq_lens_cpu,
             )
             self.raw_bs = raw_bs
             self.bs = bs
@@ -212,7 +213,7 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             if self.require_gathered_buffer:
                 gathered_buffer = torch.zeros(
                     (
-                        num_tokens,
+                        bs * self.dp_size if self.dp_size > 1 else num_tokens,
                         self.model_runner.model_config.hidden_size,
                     ),
                     dtype=self.model_runner.dtype,
@@ -222,7 +223,6 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
                 dtype=torch.float,
             )
 
-        num_tokens = bs * self.num_tokens_per_bs
         if self.require_mlp_tp_gather:
             global_num_tokens_gpu = torch.tensor(
                 [num_tokens] * self.dp_size,
@@ -250,7 +250,8 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens.cpu(),
-            extend_seq_lens_cpu=torch.full((bs,), self.num_tokens_per_bs),
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens.cpu().tolist(),
             next_token_logits_buffer=next_token_logits_buffer,
             req_to_token_pool=self.model_runner.req_to_token_pool,
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
@@ -267,7 +268,6 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             attn_backend=self.eagle_worker.draft_extend_attn_backend,
-            extend_seq_lens=extend_seq_lens,
             padded_static_len=self.padded_static_len,
             can_run_graph=True,
         )
@@ -384,12 +384,13 @@ class EAGLEDraftExtendNpuGraphRunner(EAGLEDraftExtendCudaGraphRunner):
 
             # if self.require_mlp_sync:
             #     is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
-            is_bs_supported = (
-                is_bs_supported
-                and forward_batch.global_num_tokens_cpu[0]
-                - (forward_batch.seq_lens_sum - forward_batch.seq_lens_cpu[-1])
-                <= 16  # TND QS of each batch computed by actual_seq_lengths should be in range [0, 16]
-            )
+
+            # is_bs_supported = (
+            #     is_bs_supported
+            #     and forward_batch.global_num_tokens_cpu[0]
+            #     - (forward_batch.seq_lens_sum - forward_batch.seq_lens_cpu[-1])
+            #     <= 16  # TND QS of each batch computed by actual_seq_lengths should be in range [0, 16]
+            # )
             return is_bs_supported
         else:
             return super().can_run(forward_batch)

@@ -84,7 +84,6 @@ class NpuMLAMetadata:
             if forward_batch.dp_padding_mode is not None:
                 self.pad_qk_lens_list(forward_batch.global_num_tokens_cpu)
         elif forward_batch.forward_mode.is_draft_extend():
-            tp_size = get_attention_tp_size()
             self.kv_lens_list = self.q_lens_list
             self.q_lens_list = np.cumsum(forward_batch.extend_seq_lens_cpu).tolist()
             if forward_batch.dp_padding_mode is not None:
@@ -114,6 +113,7 @@ class NpuMLAMetadata:
                 pass
             else:
                 mc2_mask = mc2_mask.tensor_split(tp_size)[tp_rank]
+            return mc2_mask
 
         if (
             forward_batch.forward_mode == ForwardMode.EXTEND
@@ -138,7 +138,11 @@ class NpuMLAMetadata:
                 )
         else:
             raise ValueError(f"unsupported forward mode {forward_batch.forward_mode}")
-        max_bs_qlen = max(forward_batch.global_num_tokens_cpu)
+        max_bs_qlen = (
+            max(forward_batch.global_num_tokens_cpu)
+            if dp_size > 1
+            else forward_batch.input_ids.numel()
+        )
         self.mc2_mask = create_mask(vaild_tokens, max_bs_qlen)
 
     def pad_qk_lens_list(self, global_num_tokens_cpu):
@@ -247,7 +251,7 @@ class NpuMLABackend(TorchNativeAttnBackend):
         )
         max_total_tokens = model_runner.server_args.max_total_tokens or MAX_SEQ_LEN
         self.max_seqlen_pad = max_total_tokens // model_runner.server_args.page_size
-        self.graph_metadata = {}
+        self.block_kv_indices = {}
 
     def init_forward_metadata(self, forward_batch: ForwardBatch, skip_fa: bool = False):
         if skip_fa:
@@ -260,8 +264,8 @@ class NpuMLABackend(TorchNativeAttnBackend):
             or forward_batch.forward_mode.is_draft_extend()
         ):
             bs = forward_batch.seq_lens_cpu.size(0)
-            if bs in self.graph_metadata:
-                block_kv_indices = self.graph_metadata[bs]
+            if bs in self.block_kv_indices:
+                block_kv_indices = self.block_kv_indices[bs]
                 block_kv_indices.fill_(-1)
             else:
                 block_kv_indices = torch.full(
@@ -315,32 +319,32 @@ class NpuMLABackend(TorchNativeAttnBackend):
         spec_info: Optional[SpecInfo],
         forward_batch: ForwardBatch,
     ):
-        metadata = NpuMLAMetadata(
-            torch.full(
-                (bs, self.max_seqlen_pad),
-                0,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            ),
-            [1] * bs,
+        block_kv_indices = torch.full(
+            (bs, self.max_seqlen_pad),
+            0,
+            dtype=torch.int32,
+            device=seq_lens.device,
+        )
+        self.forward_metadata = NpuMLAMetadata(
+            block_kv_indices,
+            forward_batch.seq_lens_cpu.tolist(),
             forward_batch,
         )
-        self.graph_metadata[bs] = metadata
-        self.forward_metadata = metadata
+        self.block_kv_indices[bs] = block_kv_indices
 
     def init_forward_metadata_replay_cuda_graph(
         self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
-        seq_lens_cpu: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+        # bs: int,
+        # req_pool_indices: torch.Tensor,
+        # seq_lens: torch.Tensor,
+        # seq_lens_sum: int,
+        # encoder_lens: Optional[torch.Tensor],
+        # forward_mode: ForwardMode,
+        # spec_info: Optional[SpecInfo],
+        # seq_lens_cpu: Optional[torch.Tensor],
     ):
-        if bs in self.graph_metadata:
-            self.forward_metadata = self.graph_metadata[bs]
+        self.init_forward_metadata(forward_batch, forward_batch.forward_mode.is_idle())
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
