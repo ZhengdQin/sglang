@@ -19,6 +19,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
+    is_npu,
     is_hip,
     set_weight_attrs,
     use_intel_amx_backend,
@@ -34,7 +35,11 @@ if TYPE_CHECKING:
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _is_npu:
+    import torch_npu
 
 if _use_aiter:
     from aiter import ActivationType
@@ -213,6 +218,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
+        if _is_npu:
+            w13_ptr = layer.w13_weight.data.data_ptr()
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, 29)  # 29: format nz
+            torch_npu.npu.caching_allocator_delete(w13_ptr)
+
+            w2_ptr = layer.w2_weight.data.data_ptr()
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, 29)  # 29: format nz
+            torch_npu.npu.caching_allocator_delete(w2_ptr)
 
         return
 

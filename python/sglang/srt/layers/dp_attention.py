@@ -61,16 +61,17 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        if is_extend_in_batch:
-            return DpPaddingMode.SUM_LEN
+        # if is_extend_in_batch:
+        #     return DpPaddingMode.SUM_LEN
 
-        # we choose the mode that minimizes the communication cost
-        max_len = max(global_num_tokens)
-        sum_len = sum(global_num_tokens)
-        if sum_len * 2 > max_len * get_attention_dp_size():
-            return cls.MAX_LEN
-        else:
-            return cls.SUM_LEN
+        # # we choose the mode that minimizes the communication cost
+        # max_len = max(global_num_tokens)
+        # sum_len = sum(global_num_tokens)
+        # if sum_len * 2 > max_len * get_attention_dp_size():
+        #     return cls.MAX_LEN
+        # else:
+        #     return cls.SUM_LEN
+        return cls.MAX_LEN
 
     @classmethod
     def get_default_mode_in_cuda_graph(cls) -> DpPaddingMode:

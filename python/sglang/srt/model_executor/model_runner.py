@@ -2211,6 +2211,7 @@ class ModelRunner:
         )
 
         if can_run_graph:
+            forward_batch.input_ids = forward_batch.input_ids.to(torch.int64)
             ret = self.graph_runner.replay(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,

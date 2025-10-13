@@ -49,7 +49,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_float4_e2m1fn_x2, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_float4_e2m1fn_x2, is_npu, next_power_of_2, get_bool_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -1331,16 +1331,16 @@ class AscendTokenToKVPool(MHATokenToKVPool):
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
-        torch_npu._npu_reshape_and_cache(
-            key=cache_k,
-            value=cache_v,
-            key_cache=self.k_buffer[layer_id - self.start_layer].view(
-                -1, self.page_size, self.head_num, self.head_dim
-            ),
-            value_cache=self.v_buffer[layer_id - self.start_layer].view(
-                -1, self.page_size, self.head_num, self.head_dim
-            ),
-            slot_indices=loc,
+        loc = loc.to(torch.int32)
+        torch_npu.npu_scatter_nd_update_(
+            self.k_buffer[layer_id - self.start_layer].view(-1, self.head_num, self.head_dim),
+            loc.view(-1, 1),
+            cache_k.view(-1, self.head_num, self.head_dim),
+        )
+        torch_npu.npu_scatter_nd_update_(
+            self.v_buffer[layer_id - self.start_layer].view(-1, self.head_num, self.head_dim),
+            loc.view(-1, 1),
+            cache_v.view(-1, self.head_num, self.head_dim),
         )
 
 

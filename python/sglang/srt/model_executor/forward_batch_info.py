@@ -750,7 +750,7 @@ class ForwardBatch:
         if self.forward_mode.is_decode():
             if self.is_extend_in_batch and dp_padding_mode.is_max_len():
                 setattr(self, "_original_forward_mode", self.forward_mode)
-                self.forward_mode = ForwardMode.EXTEND
+                # self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs
                 self.extend_seq_lens = torch.full_like(self.seq_lens, 1)
                 self.extend_prefix_lens = self.seq_lens - 1

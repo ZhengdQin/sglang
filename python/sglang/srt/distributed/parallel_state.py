@@ -435,6 +435,8 @@ class GroupCoordinator:
                 self.cpu_group, 1 << 22, 6
             )
 
+        self.comm_name = self.get_group_name()
+
     def __repr__(self):
         return (
             f"ranks={self.ranks} rank={self.rank} local_rank={self.local_rank} use_pynccl={self.use_pynccl} "
@@ -475,6 +477,9 @@ class GroupCoordinator:
         rank_in_group = self.rank_in_group
         world_size = self.world_size
         return self.ranks[(rank_in_group - 1) % world_size]
+
+    def get_group_name(self):
+        return self.device_group._get_backend(torch.device("npu")).get_hccl_comm_name(self.rank)
 
     @contextmanager
     def graph_capture(

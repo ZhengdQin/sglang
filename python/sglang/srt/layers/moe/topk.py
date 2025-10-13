@@ -438,12 +438,14 @@ def fused_topk_torch_native(
             hidden_states.shape[0] == gating_output.shape[0]
         ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
         M, _ = hidden_states.shape
-        topk_weights = torch.empty(
-            M, topk, dtype=torch.float32, device=hidden_states.device
-        )
-        topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
-        topk_weights = F.softmax(gating_output.float(), dim=-1)
-        topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        # topk_weights = torch.empty(
+        #     M, topk, dtype=torch.float32, device=hidden_states.device
+        # )
+        # topk_ids = torch.empty(M, topk, dtype=torch.int32, device=hidden_states.device)
+        # topk_weights = F.softmax(gating_output.float(), dim=-1)
+        # topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
+        gating_output = gating_output.float()
+        topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k_softmax(gating_output, None, k=topk)
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
@@ -958,10 +960,10 @@ def select_experts(
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
     elif torch_native and custom_routing_function is None:
-        assert (
-            num_token_non_padded is None
-        ), "num_token_non_padded is not yet supported in fused_topk_native"
-        assert expert_location_dispatch_info is None
+        # assert (
+        #     num_token_non_padded is None
+        # ), "num_token_non_padded is not yet supported in fused_topk_native"
+        # assert expert_location_dispatch_info is None
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
         topk_weights, topk_ids = fused_topk_native(
             hidden_states=hidden_states,

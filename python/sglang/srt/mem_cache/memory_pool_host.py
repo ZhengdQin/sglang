@@ -26,8 +26,8 @@ if not (_is_npu or _is_xpu):
         transfer_kv_per_layer_mla_pf_lf,
         transfer_kv_per_layer_pf_lf,
     )
-if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+# if _is_npu:
+#     from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
 
 logger = logging.getLogger(__name__)
 

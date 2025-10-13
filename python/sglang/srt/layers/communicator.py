@@ -791,16 +791,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
         *,
         residual_input_mode,
     ):
-        input_hidden_states = hidden_states
-        hidden_states = hidden_states.tensor_split(context.attn_tp_size)[
-            context.attn_tp_rank
-        ]
-        attn_tp_reduce_scatter_tensor(hidden_states, input_hidden_states)
+        bs, hidden_size = hidden_states.shape
+        bs_scattered = bs // context.attn_tp_size
+        hidden_states_scattered = torch.empty((bs_scattered, hidden_size),
+                                              dtype=hidden_states.dtype,
+                                              device=hidden_states.device
+                                              )
+        attn_tp_reduce_scatter_tensor(hidden_states_scattered, hidden_states)
         if residual_input_mode == ScatterMode.TP_ATTN_FULL:
             residual = residual.tensor_split(context.attn_tp_size)[context.attn_tp_rank]
-        if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
-        return hidden_states, residual
+        if hidden_states_scattered.shape[0] != 0:
+            hidden_states_scattered, residual = layernorm(hidden_states_scattered, residual)
+        return hidden_states_scattered, residual
 
     @staticmethod
     def _tp_all_reduce_with_scattered_residual(
