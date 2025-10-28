@@ -786,19 +786,12 @@ class Indexer(CustomOp):
         )
 
         if is_prefill:
-            actual_seq_lengths_kv = forward_batch.seq_lens.to(device=q.device)
-            actual_seq_lengths_q = forward_batch.seq_lens.cumsum(dim=0).to(
-                device=q.device
-            )
             if enable_index_cp:
+                actual_seq_lengths_kv = forward_batch.seq_lens.clone()
+                actual_seq_lengths_q = forward_batch.seq_lens.cumsum(dim=0)
                 rank_offset = (
                     self.attention_tp_rank + self.attention_tp_size * self.cp_rank
                 )
-            elif self.cp_size > 1:
-                rank_offset = self.cp_rank
-            else:
-                rank_offset = None
-            if rank_offset is not None:
                 actual_seq_lengths_q -= bs * rank_offset
                 actual_seq_lengths_q.clip_(min=0, max=bs)
                 total_num = bs * (rank_offset + 1)
@@ -808,6 +801,16 @@ class Indexer(CustomOp):
                         total_num = 0
                     else:
                         total_num -= actual_seq_lengths_kv[i]
+            elif self.cp_size > 1:
+                actual_seq_lengths_q = (
+                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q
+                )
+                actual_seq_lengths_kv = (
+                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv
+                )
+            else:
+                actual_seq_lengths_kv = forward_batch.seq_lens
+                actual_seq_lengths_q = forward_batch.seq_lens.cumsum(dim=0)
         else:
             if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
