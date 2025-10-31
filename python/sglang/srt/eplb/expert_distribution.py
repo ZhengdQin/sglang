@@ -118,6 +118,20 @@ class ExpertDistributionRecorder(ABC):
         )
 
 
+class NpuExpertDistributionRecorder(ExpertDistributionRecorder):
+    def __init__(self) -> None:
+        pass
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+    def with_current_layer(self, layer_idx):
+        return self
+
+
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
     pass
 
@@ -274,7 +288,10 @@ _global_expert_distribution_recorder: Optional[ExpertDistributionRecorder] = (
 
 
 def get_global_expert_distribution_recorder():
-    return _global_expert_distribution_recorder
+    if _is_npu:
+        return NpuExpertDistributionRecorder()
+    else:
+        return _global_expert_distribution_recorder
 
 
 def set_global_expert_distribution_recorder(value):

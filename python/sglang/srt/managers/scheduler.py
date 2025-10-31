@@ -525,6 +525,14 @@ class Scheduler(
 
         # Init overlap
         self.init_overlap()
+        
+        if self.device == "npu" and server_args.enable_torch_compile:
+            if self.tp_worker.model_runner.graph_runner is not None:
+                if self.enable_overlap:
+                    with self.forward_stream_ctx:
+                        self.tp_worker.model_runner.graph_runner.initialize()
+                else:
+                    self.tp_worker.model_runner.graph_runner.initialize()
 
         # Init mlp sync flag
         self.require_mlp_sync = require_mlp_sync(server_args)

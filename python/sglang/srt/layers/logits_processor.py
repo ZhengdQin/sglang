@@ -861,7 +861,7 @@ class LogitsProcessor(nn.Module):
                         device=logits.device,
                         dtype=logits.dtype,
                     )
-                    attn_tp_all_gather_into_tensor(global_logits, logits)
+                    attn_tp_all_gather_into_tensor(global_logits, logits.unsqueeze(0))
                     global_logits = global_logits.permute(1, 0, 2).reshape(
                         logits.shape[0], self.config.vocab_size
                     )
