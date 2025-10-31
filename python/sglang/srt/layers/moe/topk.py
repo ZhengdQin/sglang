@@ -373,7 +373,6 @@ class TopK(CustomOp):
             return StandardTopKOutput(topk_weights, topk_ids, _)
         if use_grouped_topk and not torch_native and router_logits.shape[-1] == 256:
             # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
-            routed_scaling_factor = self.topk_config.routed_scaling_factor or 1
 
             topk_weights, topk_ids, _ = torch_npu.npu_moe_gating_top_k(
                 router_logits.to(torch.float32),
@@ -384,17 +383,9 @@ class TopK(CustomOp):
                 group_select_mode=1,
                 renorm=0,
                 norm_type=1,
-                routed_scaling_factor=routed_scaling_factor,
+                routed_scaling_factor=1,
                 eps=float(1e-20),
             )
-
-            if renormalize:
-                topk_weights_sum = (
-                    topk_weights.sum(dim=-1, keepdim=True)
-                    if self.topk_config.num_fused_shared_experts == 0
-                    else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
-                )
-                topk_weights = topk_weights / topk_weights_sum
 
             if expert_location_dispatch_info is not None:
                 topk_ids = topk_ids_logical_to_physical(
