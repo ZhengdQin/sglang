@@ -12,10 +12,14 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
+    get_indexer_stream,
+    get_indexer_weight_stream,
     is_cuda,
     is_hip,
     is_npu,
 )
+
+_use_multi_stream = get_bool_env_var("USE_MULTI_STREAM", "0")
 
 if is_cuda():
     try:
@@ -739,19 +743,51 @@ class Indexer(CustomOp):
                 ]
 
         bs = x.shape[0]
-        q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-        q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
-        q_pe, q_nope = torch.split(
-            q,
-            [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-            dim=-1,
-        )  # [bs, 64, 64 + 64]
+        if _use_multi_stream:
+            indexer_stream = get_indexer_stream()
+            indexer_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(indexer_stream):
+                q = self.wq_b(q_lora)[
+                    0
+                ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+                wq_b_event = indexer_stream.record_event()
+                q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+                q_pe, q_nope = torch.split(
+                    q,
+                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                    dim=-1,
+                )  # [bs, 64, 64 + 64]
+                q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+                q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(
+                    bs, self.n_heads, self.rope_head_dim
+                )  # [bs, n, d]
+                q = torch.cat([q_pe, q_nope], dim=-1)
+                q.record_stream(indexer_stream)
+                q_rope_event = indexer_stream.record_event()
+        else:
+            q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+            q_pe, q_nope = torch.split(
+                q,
+                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                dim=-1,
+            )  # [bs, 64, 64 + 64]
+            q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+            q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(
+                bs, self.n_heads, self.rope_head_dim
+            )  # [bs, n, d]
+            q = torch.cat([q_pe, q_nope], dim=-1)
 
-        q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(
-            bs, self.n_heads, self.rope_head_dim
-        )  # [bs, n, d]
-        q = torch.cat([q_pe, q_nope], dim=-1)
+        if _use_multi_stream:
+            indexer_weight_stream = get_indexer_weight_stream()
+            indexer_weight_stream.wait_stream(torch.npu.current_stream())
+            indexer_weight_stream.wait_event(wq_b_event)
+            with torch.npu.stream(indexer_weight_stream):
+                indexer_weights = self.weights_proj(x)[0]
+                indexer_weights.record_stream(indexer_weight_stream)
+                weights_event = indexer_weight_stream.record_event()
+        else:
+            indexer_weights = None
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
@@ -840,7 +876,16 @@ class Indexer(CustomOp):
                 )
 
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
-        weights = self.weights_proj(x.view(-1, self.hidden_size))[0]
+
+        if _use_multi_stream:
+            torch.npu.current_stream().wait_event(q_rope_event)
+            torch.npu.current_stream().wait_event(weights_event)
+
+        if indexer_weights is None:
+            weights = self.weights_proj(x.view(-1, self.hidden_size))[0]
+        else:
+            weights = indexer_weights
+
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
         block_table = (
             block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table

@@ -610,18 +610,40 @@ def make_layers_non_pp(
 
 
 cmo_stream = None
+indexer_stream = None
+indexer_weight_stream = None
 
 
-def get_cmo_stream():
+def get_cmo_stream(device="cuda"):
     """
     Cache Management Operation(CMO).
     Launch a new stream to prefetch the weight of matmul when running other
     AIV or communication kernels, aiming to overlap the memory access time.
     """
+    if is_npu():
+        device = "npu"
     global cmo_stream
     if cmo_stream is None:
-        cmo_stream = torch.get_device_module().Stream()
+        cmo_stream = torch.get_device_module(device).Stream()
     return cmo_stream
+
+
+def get_indexer_weight_stream(device="cuda"):
+    if is_npu():
+        device = "npu"
+    global indexer_weight_stream
+    if indexer_weight_stream is None:
+        indexer_weight_stream = torch.get_device_module(device).Stream()
+    return indexer_weight_stream
+
+
+def get_indexer_stream(device="cuda"):
+    if is_npu():
+        device = "npu"
+    global indexer_stream
+    if indexer_stream is None:
+        indexer_stream = torch.get_device_module(device).Stream()
+    return indexer_stream
 
 
 def prepare_weight_cache(handle, cache):

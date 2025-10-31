@@ -130,7 +130,9 @@ from sglang.srt.utils import (
     bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
+    get_cmo_stream,
     get_device_sm,
+    get_indexer_stream,
     get_int_env_var,
     is_cpu,
     is_cuda,
@@ -142,6 +144,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
+    wait_cmo_stream,
 )
 
 _is_hip = is_hip()
@@ -821,9 +824,14 @@ class DeepseekV2MoE(nn.Module):
 
         if hidden_states.shape[0] > 0:
             if not self._fuse_shared_experts_inside_sbo:
-                shared_output = self._forward_shared_experts(
-                    hidden_states, gemm_output_zero_allocator
-                )
+                main_event = torch.npu.Event()
+                main_event.record()
+                cmo_stream = get_cmo_stream()
+                with torch.npu.stream(cmo_stream):
+                    cmo_stream.wait_event(main_event)
+                    shared_output = self._forward_shared_experts(
+                        hidden_states, gemm_output_zero_allocator
+                    )
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_output = self.topk(hidden_states, router_logits)
@@ -860,6 +868,8 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
+
+        wait_cmo_stream()
         if shared_output is not None:
             final_hidden_states += shared_output
         if (
@@ -936,6 +946,17 @@ class DeepseekV2MoE(nn.Module):
     ) -> torch.Tensor:
         shared_output = None
         if hidden_states.shape[0] > 0:
+            # prefetch and forward share experts on the same stream
+            main_event = torch.npu.Event()
+            main_event.record()
+            cmo_stream = get_cmo_stream()
+            with torch.npu.stream(cmo_stream):
+                cmo_stream.wait_event(main_event)
+                shared_output = self._forward_shared_experts(hidden_states)
+                if _is_npu:
+                    PREFETCH_MAX_SIZE = 1000000000
+                    for weight in [self.experts.w13_weight, self.experts.w2_weight]:
+                        torch_npu.npu_prefetch(weight, shared_output, PREFETCH_MAX_SIZE)
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states)
             if not self._fuse_shared_experts_inside_sbo:
@@ -973,6 +994,7 @@ class DeepseekV2MoE(nn.Module):
             ),
         )
 
+        wait_cmo_stream()
         if shared_output is not None:
             x = shared_output
             if self.experts.should_fuse_routed_scaling_factor_in_topk:
@@ -1995,23 +2017,29 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.qk_nope_head_dim,
                     self.qk_rope_head_dim,
                 )
-            (
-                q_pe,
-                k_pe,
-                q_nope_out,
-                k_nope,
-                forward_batch,
-                zero_allocator,
-                positions,
-            ) = self.mla_preprocess.forward(
-                positions, hidden_states, forward_batch, zero_allocator
-            )
+            indexer_stream = get_indexer_stream()
+            mla_event = torch.npu.Event()
+            mla_event.record()
+            with torch.npu.stream(indexer_stream):
+                torch.npu.current_stream().wait_event(mla_event)
+                (
+                    q_pe,
+                    k_pe,
+                    q_nope_out,
+                    k_nope,
+                    forward_batch,
+                    zero_allocator,
+                    positions,
+                ) = self.mla_preprocess.forward(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
 
             fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
             q, _ = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q_lora = self.q_a_layernorm(q)
+            torch.npu.current_stream().wait_event(indexer_stream)
         else:
             from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
