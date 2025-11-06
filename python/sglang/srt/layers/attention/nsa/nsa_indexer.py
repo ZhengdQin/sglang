@@ -719,27 +719,10 @@ class Indexer(CustomOp):
             and not forward_batch.forward_mode.is_draft_extend()
         )
 
-        cos_sin = self.rotary_emb.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        cos = cos.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
-        sin = sin.repeat(1, 2).view(-1, 1, 1, self.rope_head_dim)
         if is_prefill:
-            assert not (enable_index_cp and self.cp_size > 1)
-            if self.cp_size > 1:  # todo(zyj),  can split position at first
-                cos = cos.tensor_split(self.cp_size)[self.cp_rank]
-                sin = sin.tensor_split(self.cp_size)[self.cp_rank]
-            if enable_index_cp:
-                slice_length = cos.shape[0] // self.attention_tp_size
-                cos = cos[
-                    slice_length
-                    * self.attention_tp_rank : slice_length
-                    * (self.attention_tp_rank + 1)
-                ]
-                sin = sin[
-                    slice_length
-                    * self.attention_tp_rank : slice_length
-                    * (self.attention_tp_rank + 1)
-                ]
+            cos, sin = forward_batch.attn_backend.forward_metadata.cos_sin_cp
+        else:
+            cos, sin = forward_batch.attn_backend.forward_metadata.cos_sin
 
         bs = x.shape[0]
         if _use_multi_stream:

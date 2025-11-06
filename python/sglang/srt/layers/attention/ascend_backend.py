@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import custom_ops  # noqa: F401
 import numpy as np
 import torch
 import torch_npu
@@ -42,6 +43,10 @@ class ForwardMetadata:
     seq_lens: Optional[torch.Tensor] = None
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
+
+    # rope cos/sin
+    cos_sin: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    cos_sin_cp: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
 
 class AscendAttnBackend(AttentionBackend):

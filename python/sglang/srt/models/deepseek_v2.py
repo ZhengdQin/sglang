@@ -1543,6 +1543,41 @@ class DeepseekV2AttentionMLA(nn.Module):
                 ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states, None, forward_batch, None
 
+        if forward_batch.attn_backend.forward_metadata.cos_sin is None:
+            cos_sin = self.rotary_emb.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            cos = cos.repeat(1, 2).view(-1, 1, 1, self.qk_rope_head_dim)
+            sin = sin.repeat(1, 2).view(-1, 1, 1, self.qk_rope_head_dim)
+            forward_batch.attn_backend.forward_metadata.cos_sin = (cos, sin)
+
+            enable_index_cp = (
+                get_bool_env_var("SGLANG_USE_AG_AFTER_QLORA") and self.layer_id >= 4
+            )
+            is_prefill = (
+                forward_batch.forward_mode.is_extend()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+                and not forward_batch.forward_mode.is_target_verify()
+                and not forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            if is_prefill:
+                assert not (enable_index_cp and self.cp_size > 1)
+                if self.cp_size > 1:
+                    cos = cos.tensor_split(self.cp_size)[self.cp_rank]
+                    sin = sin.tensor_split(self.cp_size)[self.cp_rank]
+                if enable_index_cp:
+                    slice_length = cos.shape[0] // self.attention_tp_size
+                    cos = cos[
+                        slice_length
+                        * self.attention_tp_rank : slice_length
+                        * (self.attention_tp_rank + 1)
+                    ]
+                    sin = sin[
+                        slice_length
+                        * self.attention_tp_rank : slice_length
+                        * (self.attention_tp_rank + 1)
+                    ]
+                forward_batch.attn_backend.forward_metadata.cos_sin_cp = (cos, sin)
+
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
