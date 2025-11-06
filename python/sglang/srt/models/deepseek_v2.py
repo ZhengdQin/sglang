@@ -181,7 +181,6 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
-    import custom_ops  # noqa: F401
     import sgl_kernel_npu  # noqa: F401
     import torch_npu  # noqa: F401
 
@@ -3532,6 +3531,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         futures.append(
