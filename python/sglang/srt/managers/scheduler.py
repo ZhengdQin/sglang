@@ -327,6 +327,7 @@ class Scheduler(
         draft_worker_kwargs = dict(
             gpu_id=gpu_id,
             tp_rank=tp_rank,
+            cp_rank=cp_rank,
             moe_ep_rank=moe_ep_rank,
             server_args=server_args,
             nccl_port=port_args.nccl_port,

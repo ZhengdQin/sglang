@@ -397,6 +397,88 @@ class DeepEPMoE(FusedMoE):
             )[0]
             return hidden_states
 
+        def _forward_npu_int4(
+            hidden_states,
+            hidden_states_scale,
+            group_list_type,
+            group_list,
+            output_dtype,
+        ):
+            if hidden_states_scale is None:
+                # gmm1: gate_up_proj
+                hidden_states = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w13_weight],
+                    antiquant_scale=[self.w13_weight_scale],
+                    antiquant_offset=[self.w13_weight_offset],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
+
+                # act_fn: swiglu
+                hidden_states = torch_npu.npu_swiglu(hidden_states)
+
+                # gmm2: down_proj
+                out_hidden = torch_npu.npu_grouped_matmul(
+                    x=[hidden_states],
+                    weight=[self.w2_weight],
+                    antiquant_scale=[self.w2_weight_scale],
+                    antiquant_offset=[self.w2_weight_offset],
+                    split_item=2,
+                    group_list_type=group_list_type,
+                    group_type=0,
+                    group_list=group_list,
+                    output_dtype=output_dtype,
+                )[0]
+            else:
+                mm1_mm3 = torch_npu.npu_grouped_matmul(
+                    [hidden_states],
+                    [self.w13_weight],
+                    bias=[self.w13_bias],
+                    scale=[self.w13_weight_scale],
+                    per_token_scale=[hidden_states_scale],
+                    group_list=group_list,
+                    split_item=3,
+                    output_dtype=output_dtype,
+                    group_type=0,
+                    group_list_type=group_list_type,
+                    act_type=0,
+                )[0]
+                if self.w2_alpha is not None:
+                    intermediate_h, pertoken_scale = torch_npu.npu_swiglu_clip_quant(
+                        mm1_mm3,
+                        group_list,
+                        self.w2_alpha,
+                        activate_left=True,
+                        quant_mode=1,
+                        clamp_mode=1,
+                    )
+                else:
+                    from sgl_kernel_npu.activation.swiglu_quant import swiglu_quant
+
+                    intermediate_h, pertoken_scale = swiglu_quant(
+                        hidden_states, group_list, group_list_type
+                    )
+
+                out_hidden = torch_npu.npu_grouped_matmul(
+                    [intermediate_h],
+                    [self.w2_weight],
+                    bias=[self.w2_bias],
+                    scale=[self.w2_weight_scale],
+                    per_token_scale=[pertoken_scale],
+                    group_list=group_list,
+                    split_item=3,
+                    output_dtype=output_dtype,
+                    group_type=0,
+                    group_list_type=group_list_type,
+                    act_type=0,
+                )[0]
+
+            return out_hidden
+
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             if TYPE_CHECKING:
                 assert isinstance(dispatch_output, DeepEPNormalDispatchOutput)
@@ -407,23 +489,41 @@ class DeepEPMoE(FusedMoE):
                 hidden_states.device
             )
 
-            if self.w13_weight.dtype != torch.int8:
+            if self.w13_weight.dtype == torch.bfloat16:
                 hidden_states = _forward_npu_bf16(
                     hidden_states, group_list_type, group_list, output_dtype
                 )
             else:
-                if not get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT"):
-                    hidden_states, hidden_states_scale = torch_npu.npu_dynamic_quant(
-                        hidden_states
+                input_quant = get_bool_env_var("DEEP_NORMAL_MODE_USE_INT8_QUANT")
+                if not input_quant and self.w13_weight.dtype == torch.int32:
+                    hidden_states = _forward_npu_int4(
+                        hidden_states,
+                        None,
+                        group_list_type,
+                        group_list,
+                        output_dtype,
                     )
-                hidden_states = _forward_npu_int8(
-                    hidden_states,
-                    hidden_states_scale,
-                    group_list_type,
-                    group_list,
-                    output_dtype,
-                )
-
+                else:
+                    if not input_quant:
+                        hidden_states, hidden_states_scale = (
+                            torch_npu.npu_dynamic_quant(hidden_states)
+                        )
+                    if self.w13_weight.dtype == torch.int8:
+                        hidden_states = _forward_npu_int8(
+                            hidden_states,
+                            hidden_states_scale,
+                            group_list_type,
+                            group_list,
+                            output_dtype,
+                        )
+                    else:
+                        hidden_states = _forward_npu_int4(
+                            hidden_states,
+                            hidden_states_scale,
+                            group_list_type,
+                            group_list,
+                            output_dtype,
+                        )
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if TYPE_CHECKING:
                 assert isinstance(dispatch_output, DeepEPLLDispatchOutput)
@@ -437,18 +537,27 @@ class DeepEPMoE(FusedMoE):
             ) = dispatch_output
             group_list = group_list.to(torch.int64)
 
-            if self.w13_weight.dtype != torch.int8:
+            if self.w13_weight.dtype == torch.bfloat16:
                 hidden_states = _forward_npu_bf16(
                     hidden_states, group_list_type, group_list, output_dtype
                 )
             else:
-                hidden_states = _forward_npu_int8(
-                    hidden_states,
-                    hidden_states_scale,
-                    group_list_type,
-                    group_list,
-                    output_dtype,
-                )
+                if self.w13_weight.dtype == torch.int8:
+                    hidden_states = _forward_npu_int8(
+                        hidden_states,
+                        hidden_states_scale,
+                        group_list_type,
+                        group_list,
+                        output_dtype,
+                    )
+                else:
+                    hidden_states = _forward_npu_int4(
+                        hidden_states,
+                        hidden_states_scale,
+                        group_list_type,
+                        group_list,
+                        output_dtype,
+                    )
         else:
             raise ValueError(f"Not Supported DeepEP format {dispatch_output.format}")
 

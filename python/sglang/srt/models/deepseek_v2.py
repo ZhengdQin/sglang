@@ -193,7 +193,6 @@ elif _is_hip:
         awq_dequantize_triton as awq_dequantize,
     )
 elif _is_npu:
-    import custom_ops  # noqa: F401
     import sgl_kernel_npu  # noqa: F401
     import torch_npu  # noqa: F401
 
@@ -1454,7 +1453,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
         if attn_forward_method == AttnForwardMethod.MHA:
             inner_state = self.forward_normal_prepare(
-                positions, hidden_states, forward_batch, zero_allocator
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
@@ -3696,6 +3698,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                     # Skip non-stacked layers and experts (experts handled below).
                     if weight_name not in name:
                         continue
+                    name = name.replace("weight_packed", "weight")
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
                     # we need to skip here BEFORE we update the name, otherwise
@@ -3723,7 +3726,10 @@ class DeepseekV2ForCausalLM(nn.Module):
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
+                        name = name.replace("weight_packed", "weight")
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(

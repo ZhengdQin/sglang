@@ -3,7 +3,13 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
+import numpy as np
 import torch
+from compressed_tensors.quantization import (
+    QuantizationArgs,
+    QuantizationStrategy,
+    QuantizationType,
+)
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -21,7 +27,10 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
+from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    is_activation_quantization_format,
+    should_ignore_layer,
+)
 from sglang.srt.layers.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import (
@@ -57,6 +66,11 @@ if _is_npu:
         useMindIETurbo = False
     else:
         useMindIETurbo = True
+
+import logging
+
+logger = logging.getLogger(__name__)
+QUANTIZATION_SCHEME_MAP_TYPE = dict[str, Optional[dict[str, QuantizationArgs]]]
 
 
 # func refers to RMSNorm.__init__
@@ -192,7 +206,7 @@ def npu_fused_experts(
 
 
 class W8A8Int8Config(QuantizationConfig):
-    """Config class for W8A8 Int8 Quantization.
+    """Config class for W8A8 or W4A8 Quantization.
 
     - Weight: static, per-channel, symmetric
     - Activation: dynamic, per-token, symmetric
@@ -201,16 +215,28 @@ class W8A8Int8Config(QuantizationConfig):
     def __init__(self, quant_config: Dict[str, Any] = {}):
         super().__init__()
         self.quant_description = quant_config
-        self.is_dynamic = (
-            quant_config.get("is_dynamic", False)
-            or quant_config.get("model_quant_type", "STATIC") == "W8A8_DYNAMIC"
-        )
+        self.is_dynamic = quant_config.get("is_dynamic", False)
+        self.is_moe_w4a8_dynamic = False
         ignore = cast(List[str], quant_config.get("ignore", []))
         self.ignore = ignore if ignore is not None else []
         packed_modules_mapping = quant_config.get("packed_modules_mapping", {})
         self.packed_modules_mapping = (
             packed_modules_mapping if packed_modules_mapping is not None else {}
         )
+        self.target_scheme_map = self._quantization_scheme_map_from_config(
+            config=quant_config
+        )
+        target = "MoEGMM"
+        target_scheme = self.target_scheme_map.get(target, None)
+        if target_scheme is None:
+            self.is_moe_w4a8_dynamic = False
+        else:
+            weight_quant = target_scheme.get("weights")
+            input_quant = target_scheme.get("input_activations")
+            self.is_moe_w4a8_dynamic = self.is_dynamic_token_w4(
+                weight_quant, input_quant
+            )
+            self.is_moe_input_quant = input_quant
 
         if _is_npu:
             if self.is_dynamic:
@@ -270,11 +296,15 @@ class W8A8Int8Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if _is_npu:
-            if should_ignore_layer(
-                prefix, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
-            ):
-                return UnquantizedLinearMethod()
             if isinstance(layer, LinearBase):
+                if should_ignore_layer(
+                    prefix,
+                    ignore=self.ignore,
+                    fused_mapping=self.packed_modules_mapping,
+                ):
+                    # if get_tensor_model_parallel_rank() == 0:
+                    #     logger.info(f"should_ignore_layer {prefix=}")
+                    return UnquantizedLinearMethod()
                 key = "model"
                 if "vision_model" in prefix:
                     key = "vision_model"
@@ -301,7 +331,19 @@ class W8A8Int8Config(QuantizationConfig):
                     else NPU_W8A8LinearMethod(self)
                 )
             elif isinstance(layer, FusedMoE):
-                return NPU_W8A8MoEMethod(self)
+                prefix_in_quant_config = prefix + ".0.down_proj.weight"
+                is_moe_w4a8_dynamic = (
+                    self.quant_description.get(prefix_in_quant_config, "STATIC")
+                    == "W4A8_DYNAMIC"
+                )
+                if (
+                    self.is_moe_w4a8_dynamic and self.is_moe_input_quant is not None
+                ) or is_moe_w4a8_dynamic:
+                    return NPU_W4A8MoEMethod(self, have_alpha=self.is_moe_w4a8_dynamic)
+                elif self.is_moe_w4a8_dynamic and self.is_moe_input_quant is None:
+                    return NPU_W4A16MoEMethod(self)
+                else:
+                    return NPU_W8A8MoEMethod(self)
             return None
 
         if should_ignore_layer(
@@ -347,6 +389,77 @@ class W8A8Int8Config(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    @classmethod
+    def _quantization_scheme_map_from_config(
+        cls, config: Dict[str, Any]
+    ) -> QUANTIZATION_SCHEME_MAP_TYPE:
+        """
+        :param config: The `quantization_config` dictionary from config.json
+        :return: A dictionary mapping target layer names to their corresponding
+            quantization_args for weights and input activations
+        """
+        target_scheme_map: Dict[str, Any] = dict()
+        quant_format = cast(str, config.get("format"))
+
+        # The quant_config has multiple config_groups, each containing
+        # an input_activations key with details about how the activations are
+        # quantized, a weights key indicating how the weights are quantized,
+        # and a list of targets under the `targets` key, dictating which
+        # layers are impacted by the quantization details. The quantization
+        # details follow the structure defined by the QuantizationArgs
+        # pydantic model, which is used to verify the structure of the
+        # quant_config and also store the details for later use.
+
+        config_groups = config.get("config_groups", dict())
+        for _, quant_config in config_groups.items():
+            targets = quant_config.get("targets")
+            for target in targets:
+                target_scheme_map[target] = {}
+                target_scheme_map[target]["weights"] = QuantizationArgs.model_validate(
+                    quant_config.get("weights")
+                )
+
+                target_scheme_map[target]["input_activations"] = None
+                if is_activation_quantization_format(quant_format):
+                    input_activations = quant_config.get("input_activations")
+                    # The only case where we have activation quant supported
+                    # but no input_activations provided in the config
+                    # should be w8a16fp8 w8a16fp8 can also run for cases where
+                    # there is an input_quant but it is ignored
+                    if not input_activations:
+                        assert (
+                            target_scheme_map[target]["weights"].type
+                            == QuantizationType.FLOAT
+                        )
+                    else:
+                        target_scheme_map[target]["input_activations"] = (
+                            QuantizationArgs.model_validate(  # noqa: E501
+                                quant_config.get("input_activations")
+                            )
+                        )
+        return target_scheme_map
+
+    def is_dynamic_token_w4(self, weight_quant, input_quant) -> bool:
+        is_w4 = weight_quant.num_bits == 4
+        weight_strategy = (
+            weight_quant.strategy == QuantizationStrategy.TENSOR.value
+            or weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            or weight_quant.strategy == QuantizationStrategy.GROUP.value
+        )
+        if input_quant is not None:
+            is_token = (
+                weight_strategy
+                and input_quant.strategy == QuantizationStrategy.TOKEN.value
+            )
+            is_dynamic = not weight_quant.dynamic and input_quant.dynamic
+        else:
+            is_token = weight_strategy
+            is_dynamic = not weight_quant.dynamic
+
+        # Both symmetric and asymmetric input quantization supported.
+        # Only symmetric weight quantization supported.
+        return is_w4 and weight_quant.symmetric and is_token and is_dynamic
 
 
 class W8A8Int8LinearMethod(LinearMethodBase):
@@ -941,6 +1054,8 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quantization_config: W8A8Int8Config) -> None:
         self.quantization_config = quantization_config
         self.quant_method = self
+        self.pack_factor = 1  # weight dtype is int8,  and use int8 to create
+        logger.warning_once("NPU_W8A8MoEMethod !!!")
 
     def create_weights(
         self,
@@ -962,7 +1077,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                2 * intermediate_size_per_partition // self.pack_factor,
                 hidden_size,
                 dtype=torch.int8,
             ),
@@ -973,7 +1088,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         w2_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                hidden_size,
+                hidden_size // self.pack_factor,
                 intermediate_size_per_partition,
                 dtype=torch.int8,
             ),
@@ -981,21 +1096,7 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
-        # scale
-        w13_weight_scale = torch.nn.Parameter(
-            torch.empty(
-                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
-        w2_weight_scale = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, 1, dtype=torch.float32),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
         # offset
         w13_weight_offset = torch.nn.Parameter(
             torch.empty(
@@ -1012,25 +1113,635 @@ class NPU_W8A8MoEMethod(FusedMoEMethodBase):
         layer.register_parameter("w2_weight_offset", w2_weight_offset)
         set_weight_attrs(w2_weight_offset, extra_weight_attrs)
 
+        weight_scale_dtype = torch.float32
+        # scale
+        w13_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                1,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.empty(num_experts, hidden_size, 1, dtype=weight_scale_dtype),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.w13_weight = Parameter(
-            layer.w13_weight.data.transpose(1, 2).contiguous(), requires_grad=False
-        )
-        layer.w2_weight = Parameter(
-            layer.w2_weight.data.transpose(1, 2).contiguous(), requires_grad=False
-        )
-        layer.w13_weight_scale = Parameter(
-            layer.w13_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
-        )
-        layer.w2_weight_scale = Parameter(
-            layer.w2_weight_scale.data.squeeze(-1).contiguous(), requires_grad=False
-        )
         layer.w13_weight_offset = Parameter(
             layer.w13_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
         )
         layer.w2_weight_offset = Parameter(
             layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
         )
+
+        w13_weight = layer.w13_weight.data.transpose(1, 2).contiguous()
+        w2_weight = layer.w2_weight.data.transpose(1, 2).contiguous()
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
+        w13_weight_scale = layer.w13_weight_scale.data.squeeze(-1).contiguous()
+        w2_weight_scale = layer.w2_weight_scale.data.squeeze(-1).contiguous()
+        layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
+        layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, _ = topk_output
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+        output = npu_fused_experts(
+            hidden_states=x,
+            w13=layer.w13_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2=layer.w2_weight,
+            w2_scale=layer.w2_weight_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+        )
+        return StandardCombineInput(hidden_states=output)
+
+
+class NPU_W4A8MoEMethod(FusedMoEMethodBase):
+    """MoE method for NPU quantization.
+
+    This class search for specific quantization
+    implementations supported on NPU hardware for moe methods.
+
+    Args:
+        quant_config: The NPU quantization config.
+    """
+
+    def __init__(self, quantization_config: W8A8Int8Config, have_alpha: bool) -> None:
+        self.quantization_config = quantization_config
+        self.quant_method = self
+        self.pack_factor = 2  # weight dtype is int4,  but use int8 to create
+        self.have_alpha = have_alpha
+        if not self.have_alpha:
+            if "MoEGMM" in quantization_config.target_scheme_map:
+                self.group_size = quantization_config.target_scheme_map["MoEGMM"].get(
+                    "group_size", 256
+                )
+            else:
+                self.group_size = 256
+        logger.warning_once("NPU_W4A8MoEMethod !!!")
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        self.num_experts = num_experts
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+        )
+
+        # weight
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition // self.pack_factor,
+                hidden_size,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size // self.pack_factor,
+                intermediate_size_per_partition,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # scale
+        if self.have_alpha:
+            weight_scale_dtype = torch.int64
+        else:
+            weight_scale_dtype = torch.float32
+        w13_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                1,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.empty(num_experts, hidden_size, 1, dtype=weight_scale_dtype),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # offset
+        w13_weight_offset = torch.nn.Parameter(
+            torch.empty(
+                num_experts, 2 * intermediate_size_per_partition, 1, dtype=torch.float32
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_offset", w13_weight_offset)
+        set_weight_attrs(w13_weight_offset, extra_weight_attrs)
+
+        w2_weight_offset = torch.nn.Parameter(
+            torch.empty(num_experts, hidden_size, 1, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_offset", w2_weight_offset)
+        set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+        # >>> special param for w4a8
+        if self.have_alpha:
+            w13_bias_name = "w13_bias"
+            w2_bias_name = "w2_bias"
+            w13_bias = torch.nn.Parameter(
+                torch.ones(
+                    num_experts, 2 * intermediate_size_per_partition, dtype=torch.float
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_bias", w13_bias)
+            set_weight_attrs(w13_bias, extra_weight_attrs)
+
+            w2_bias = torch.nn.Parameter(
+                torch.ones(num_experts, hidden_size, dtype=torch.float),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_bias", w2_bias)
+            set_weight_attrs(w2_bias, extra_weight_attrs)
+            w2_alpha = torch.nn.Parameter(
+                torch.ones(num_experts, dtype=torch.float), requires_grad=False
+            )
+            layer.register_parameter("w2_alpha", w2_alpha)
+            set_weight_attrs(w2_alpha, extra_weight_attrs)
+        else:
+            w13_bias_name = "w13_scale_bias"
+            w2_bias_name = "w2_scale_bias"
+            self.w2_alpha = None
+            w13_weight_scale_second = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // self.group_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale_second", w13_weight_scale_second)
+            set_weight_attrs(w13_weight_scale_second, extra_weight_attrs)
+            w13_weight_offset_second = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // self.group_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter(
+                "w13_weight_offset_second", w13_weight_offset_second
+            )
+            set_weight_attrs(w13_weight_offset_second, extra_weight_attrs)
+
+            w2_weight_scale_second = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.group_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_scale_second", w2_weight_scale_second)
+            set_weight_attrs(w2_weight_scale_second, extra_weight_attrs)
+
+            w2_weight_offset_second = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.group_size,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_offset_second", w2_weight_offset_second)
+            set_weight_attrs(w2_weight_offset_second, extra_weight_attrs)
+
+            w13_scale_bias = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    1,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_scale_bias", w13_scale_bias)
+            set_weight_attrs(w13_scale_bias, extra_weight_attrs)
+            tp_size = 1  # only support EP, do not support expert tp
+            w2_scale_bias = torch.nn.Parameter(
+                torch.empty(
+                    num_experts, hidden_size, 16 // tp_size, dtype=torch.float32
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_scale_bias", w2_scale_bias)
+            set_weight_attrs(w2_scale_bias, extra_weight_attrs)
+
+    def process_scale(self, weight: torch.Tensor, scale, per_group_scale):
+        scale = scale.transpose(1, 2).contiguous()
+        per_group_scale = per_group_scale.transpose(1, 2).contiguous()
+        group_num, k, n = weight.shape
+        # the weight of the new version is reduced by half by pack n, so it needs to be restored
+        n = n * 2
+        per_group_scale = per_group_scale.reshape(group_num, -1, n)
+        group_num, quantgroup_num, n = per_group_scale.shape
+
+        scale_fp32 = (scale * per_group_scale).to(torch.float16).to(torch.float32)
+        scale_fp32_np = scale_fp32.cpu().numpy()
+        scale_fp32_np.dtype = np.uint32
+        sscale_uint64 = np.zeros((group_num, quantgroup_num, n * 2), dtype=np.uint32)
+
+        sscale_uint64[..., ::2] = scale_fp32_np
+
+        sscale_uint64_buffer = np.frombuffer(
+            sscale_uint64.tobytes(), dtype=np.int64
+        ).copy()
+        sscale_uint64_tensor = torch.from_numpy(sscale_uint64_buffer).reshape(
+            group_num, quantgroup_num, n
+        )
+        sscale_uint64_tensor = sscale_uint64_tensor.npu()
+        return sscale_uint64_tensor
+
+    def pack_to_int32(self, weight: torch.Tensor):
+        # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
+        assert (
+            weight.shape[-1] % 4 == 0
+        ), "the last dim of weight needs to be divided by 4"
+        return weight.view(torch.int32).contiguous()
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if hasattr(layer, "w13_weight_scale_second"):
+            w13_weight_scale_second = (
+                layer.w13_weight_scale_second.data
+                if hasattr(layer, "w13_weight_scale_second")
+                else None
+            )
+            w2_weight_scale_second = (
+                layer.w2_weight_scale_second.data
+                if hasattr(layer, "w2_weight_scale_second")
+                else None
+            )
+            layer.w13_weight_scale.data = self.process_scale(
+                layer.w13_weight, layer.w13_weight_scale.data, w13_weight_scale_second
+            )
+            layer.w2_weight_scale.data = self.process_scale(
+                layer.w2_weight, layer.w2_weight_scale.data, w2_weight_scale_second
+            )
+            layer.w13_scale_bias.data = (
+                layer.w13_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
+            )
+            layer.w2_scale_bias.data = (
+                layer.w2_scale_bias.data.transpose(1, 2).contiguous().sum(axis=1)
+            )
+            # scale_second is no longer used, release this part of the memory
+            del layer.w13_weight_scale_second
+            del layer.w2_weight_scale_second
+            del layer.w13_weight_offset_second
+            del layer.w2_weight_offset_second
+        else:
+            w13_weight_scale = (
+                layer.w13_weight_scale.data.squeeze(-1).contiguous().unsqueeze(1)
+            )
+            w2_weight_scale = (
+                layer.w2_weight_scale.data.squeeze(-1).contiguous().unsqueeze(1)
+            )
+            layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
+            layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+
+        w13_weight = layer.w13_weight.data.transpose(1, 2).contiguous()
+        w2_weight = layer.w2_weight.data.transpose(1, 2).contiguous()
+        is_enable_nz = False  # todo
+        if is_enable_nz:
+            w13_weight = torch_npu.npu_format_cast(w13_weight, 29)
+            w2_weight = torch_npu.npu_format_cast(w2_weight, 29)
+        w13_weight = self.pack_to_int32(w13_weight)
+        w2_weight = self.pack_to_int32(w2_weight)
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+
+        layer.w13_weight_offset = Parameter(
+            layer.w13_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+        )
+        layer.w2_weight_offset = Parameter(
+            layer.w2_weight_offset.data.squeeze(-1).contiguous(), requires_grad=False
+        )
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply(
+        self,
+        layer,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+
+        topk_weights, topk_ids, _ = topk_output
+        topk_ids = topk_ids.to(torch.int32)
+        topk_weights = topk_weights.to(x.dtype)
+        output = npu_fused_experts(
+            hidden_states=x,
+            w13=layer.w13_weight,
+            w13_scale=layer.w13_weight_scale,
+            w2=layer.w2_weight,
+            w2_scale=layer.w2_weight_scale,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            top_k=topk_ids.shape[1],
+        )
+        return StandardCombineInput(hidden_states=output)
+
+
+class NPU_W4A16MoEMethod(FusedMoEMethodBase):
+    """MoE method for NPU quantization.
+
+    This class search for specific quantization
+    implementations supported on NPU hardware for moe methods.
+
+    Args:
+        quant_config: The NPU quantization config.
+    """
+
+    def __init__(self, quantization_config: W8A8Int8Config) -> None:
+        self.quantization_config = quantization_config
+        self.quant_method = self
+        self.pack_factor = 8  # weight dtype is int4,  but use int32 to create
+        if "MoEGMM" in quantization_config.target_scheme_map:
+            self.group_size = quantization_config.target_scheme_map["MoEGMM"][
+                "weights"
+            ].group_size
+        else:
+            self.group_size = 256
+        logger.warning_once("NPU_W4A16MoEMethod !!!")
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
+        self.num_experts = num_experts
+        extra_weight_attrs.update(
+            {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+        )
+        # weight
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.pack_factor,
+                dtype=torch.int32,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        # scale
+        weight_scale_dtype = torch.bfloat16
+        w13_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        w2_weight_scale = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        # offset
+        w13_weight_offset = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_offset", w13_weight_offset)
+        set_weight_attrs(w13_weight_offset, extra_weight_attrs)
+
+        w2_weight_offset = torch.nn.Parameter(
+            torch.zeros(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // self.group_size,
+                dtype=weight_scale_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_offset", w2_weight_offset)
+        set_weight_attrs(w2_weight_offset, extra_weight_attrs)
+
+    def pack_to_int32(self, weight: torch.Tensor):
+        assert weight.dim() == 3
+        if weight.dtype == torch.int32:
+            # pack 8 int4 to int32, we use a int32 to represent a int4
+            assert (
+                weight.shape[-1] % 8 == 0
+            ), "the last dim of weight needs to be divided by 8"
+            new_weight = torch_npu.npu_convert_weight_to_int4pack(weight.flatten(0, 1))
+            new_weight = new_weight.view(weight.shape[0], weight.shape[1], -1)
+        elif weight.dtype == torch.int8:
+            # pack 4 int8(int4*2) to int32, because in pytorch, we need to use int32 to represent int4
+            assert (
+                weight.shape[-1] % 4 == 0
+            ), "the last dim of weight needs to be divided by 4"
+            new_weight = weight.view(torch.int32).contiguous()
+        else:
+            raise ValueError(f"{weight.dtype=} is not supported !")
+        return new_weight
+
+    def unpack_from_int32(
+        self,
+        value: torch.Tensor,
+        num_bits: int,
+        shape: torch.Size = None,
+        packed_dim=1,
+    ) -> torch.Tensor:
+        """
+        Unpacks a tensor of packed int32 weights into individual int8s, maintaining the
+        original bit range.
+
+        Return tensors in int8
+
+        :param value: tensor to unpack
+        :param num_bits: number of bits to unpack each data point into
+        :param shape: shape to unpack into, used to remove padding
+        :returns: unpacked int8 tensor
+        """
+        if value.dtype is not torch.int32:
+            raise ValueError(
+                f"Expected {torch.int32} but got {value.dtype}, Aborting unpack."
+            )
+
+        if num_bits > 8:
+            raise ValueError("Unpacking is only supported for less than 8 bits")
+
+        pack_factor = 32 // num_bits
+
+        # unpack
+        mask = (1 << num_bits) - 1
+
+        if packed_dim == 1:
+            unpacked = torch.zeros(
+                (value.shape[0], value.shape[1] * pack_factor),
+                device=value.device,
+                dtype=torch.int32,
+            )
+            for i in range(pack_factor):
+                unpacked[:, i::pack_factor] = (value >> (num_bits * i)) & mask
+
+            # remove padding
+            if shape is not None:
+                original_row_size = int(shape[1])
+                unpacked = unpacked[:, :original_row_size]
+        else:
+            unpacked = torch.zeros(
+                (value.shape[0] * pack_factor, value.shape[1]),
+                device=value.device,
+                dtype=torch.int32,
+            )
+            for i in range(pack_factor):
+                unpacked[i::pack_factor, :] = (value >> (num_bits * i)) & mask
+
+            # remove padding
+            original_row_size = int(shape[0])
+            unpacked = unpacked[:original_row_size, :]
+
+        # bits are packed in unsigned format, reformat to signed
+        # update the value range from unsigned to signed
+        offset = pow(2, num_bits) // 2
+        unpacked = (unpacked - offset).to(torch.int8)
+
+        return unpacked
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        w13_weight_scale = layer.w13_weight_scale.data.transpose(-1, -2).contiguous()
+        w2_weight_scale = layer.w2_weight_scale.data.transpose(-1, -2).contiguous()
+        layer.w13_weight_scale = Parameter(w13_weight_scale, requires_grad=False)
+        layer.w2_weight_scale = Parameter(w2_weight_scale, requires_grad=False)
+
+        layer.w13_weight_offset = Parameter(
+            layer.w13_weight_offset.data.transpose(-1, -2).contiguous(),
+            requires_grad=False,
+        )
+        layer.w2_weight_offset = Parameter(
+            layer.w2_weight_offset.data.transpose(-1, -2).contiguous(),
+            requires_grad=False,
+        )
+
+        # w = [n, k // 8]  --> [k, n // 8]
+        # w13_weight = layer.w13_weight.data.transpose(1, 2).contiguous()
+        # w2_weight = layer.w2_weight.data.transpose(1, 2).contiguous()
+        unpacked_w13_weight = (
+            self.unpack_from_int32(layer.w13_weight.data.flatten(0, 1), 4)
+            .view(layer.w13_weight.data.shape[0], layer.w13_weight.data.shape[1], -1)
+            .transpose(1, 2)
+            .contiguous()
+            .int()
+        )
+        unpacked_w2_weight = (
+            self.unpack_from_int32(layer.w2_weight.data.flatten(0, 1), 4)
+            .view(layer.w2_weight.data.shape[0], layer.w2_weight.data.shape[1], -1)
+            .transpose(1, 2)
+            .contiguous()
+            .int()
+        )
+
+        is_enable_nz = False  # todo
+        if is_enable_nz:
+            unpacked_w13_weight = torch_npu.npu_format_cast(unpacked_w13_weight, 29)
+            unpacked_w2_weight = torch_npu.npu_format_cast(unpacked_w2_weight, 29)
+
+        w13_weight = self.pack_to_int32(unpacked_w13_weight)
+        w2_weight = self.pack_to_int32(unpacked_w2_weight)
+
+        layer.w13_weight = Parameter(w13_weight, requires_grad=False)
+        layer.w2_weight = Parameter(w2_weight, requires_grad=False)
+        # logger.info(f"{w13_weight.shape=}, {w13_weight.dtype=}, {w2_weight.shape=}")
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
