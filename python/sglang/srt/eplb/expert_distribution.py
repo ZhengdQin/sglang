@@ -131,6 +131,9 @@ class NpuExpertDistributionRecorder(ExpertDistributionRecorder):
     def with_current_layer(self, layer_idx):
         return self
 
+    def disable_this_region(self):
+        return self
+
 
 class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
     pass

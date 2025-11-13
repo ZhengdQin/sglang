@@ -359,10 +359,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
-    def replay(self, forward_batch: ForwardBatch):
-        assert forward_batch.out_cache_loc is not None
-        self.deepep_adapter.replay()
-
+    def replay_prepare(self, forward_batch: ForwardBatch):
         # batch_size and num_seqs can be different in case there are finished examples
         # in the batch, which will not be counted as num_seqs
         raw_bs = forward_batch.batch_size
@@ -430,8 +427,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=self.seq_lens_cpu,
         )
-
-        # Replay
         self.raw_bs = raw_bs
         self.bs = bs
         self._replay(forward_batch)
