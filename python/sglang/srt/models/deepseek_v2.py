@@ -2058,8 +2058,15 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            q = self.q_a_layernorm(q)
             q_lora = q.clone()  # required for topk_indices
+
+            if self.cp_size > 1:
+                latent_cache = context_model_parallel_all_gather(
+                    latent_cache.contiguous(), dim=0
+                )
+            k_nope, k_pe = latent_cache.unsqueeze(1).split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
 
             # overlap qk norm
             if self.alt_stream is not None and get_is_capture_mode():
@@ -2101,19 +2108,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                     else:
                         q = self.q_a_layernorm(q)
                         k_nope = self.kv_a_layernorm(k_nope)
-            if self.cp_size > 1:
-                latent_cache = context_model_parallel_all_gather(
-                    latent_cache.contiguous(), dim=0
-                )
 
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
-            k_nope, k_pe = latent_cache.unsqueeze(1).split(
-                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
-            k_nope = self.kv_a_layernorm(k_nope)
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
             q_nope_out = q_nope_out.transpose(0, 1)
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
