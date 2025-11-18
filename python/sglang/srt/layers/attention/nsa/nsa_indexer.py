@@ -28,6 +28,7 @@ if is_cuda():
         deep_gemm = e
 elif is_npu():
     import torch_npu
+    import custom_ops  # noqa: F401
 
 from sglang.srt.distributed import (
     context_model_parallel_all_gather,
