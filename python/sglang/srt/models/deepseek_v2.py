@@ -1115,7 +1115,11 @@ class DeepseekV2MoE(nn.Module):
             topk_output=topk_output,
         )
 
-        if self._use_multi_stream:
+        if (
+            hidden_states.shape[0] > 0
+            and not self._fuse_shared_experts_inside_sbo
+            and self._use_multi_stream
+        ):
             torch.npu.current_stream().wait_event(shared_event)
         if shared_output is not None:
             x = shared_output
