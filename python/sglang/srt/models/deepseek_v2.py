@@ -52,7 +52,9 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.npu_ops.mla_preprocess import (
     NPUFusedMLAPreprocess,
+    NPUMLAProlog,
     is_mla_preprocess_enabled,
+    is_mla_prolog_enabled,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
@@ -1376,6 +1378,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                 )
         self.is_mla_preprocess_enabled = is_mla_preprocess_enabled()
+        self.is_mla_prolog_enabled = is_mla_prolog_enabled()
         if self.is_mla_preprocess_enabled:
             assert (
                 quant_config is None or quant_config.get_name() == "w8a8_int8"
@@ -1415,6 +1418,89 @@ class DeepseekV2AttentionMLA(nn.Module):
     def op_core(self, state):
         state.hidden_states_after_attn = self.forward_core(
             state.pop("attn_intermediate_state")
+        )
+
+    def npu_mla_preprocess(
+        self, hidden_states, positions, forward_batch, zero_allocator
+    ):
+        if not self.is_mla_prolog_enabled:
+            if self.mla_preprocess is None:
+                self.mla_preprocess = NPUFusedMLAPreprocess(
+                    self.fused_qkv_a_proj_with_mqa,
+                    self.q_a_layernorm,
+                    self.kv_a_layernorm,
+                    self.q_b_proj,
+                    self.w_kc,
+                    self.rotary_emb,
+                    self.layer_id,
+                    self.num_local_heads,
+                    self.qk_nope_head_dim,
+                    self.qk_rope_head_dim,
+                )
+            indexer_stream = get_indexer_stream()
+            mla_event = torch.npu.Event()
+            mla_event.record()
+            with torch.npu.stream(indexer_stream):
+                torch.npu.current_stream().wait_event(mla_event)
+                (
+                    q_pe,
+                    k_pe,
+                    q_nope_out,
+                    k_nope,
+                    forward_batch,
+                    zero_allocator,
+                    positions,
+                ) = self.mla_preprocess.forward(
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+                q_pe.record_stream(indexer_stream)
+                k_pe.record_stream(indexer_stream)
+                q_nope_out.record_stream(indexer_stream)
+                k_nope.record_stream(indexer_stream)
+                mlapo_event = indexer_stream.record_event()
+
+            fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+            q, _ = fused_qkv_a_proj_out.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+            )  # 1536 / 512+64
+            q_lora = self.q_a_layernorm(q)
+            torch.npu.current_stream().wait_event(mlapo_event)
+        else:
+            if self.mla_preprocess is None:
+                self.mla_preprocess = NPUMLAProlog(
+                    self.fused_qkv_a_proj_with_mqa,
+                    self.q_a_layernorm,
+                    self.kv_a_layernorm,
+                    self.q_b_proj,
+                    self.w_kc,
+                    self.rotary_emb,
+                    self.layer_id,
+                    self.num_local_heads,
+                    self.qk_nope_head_dim,
+                    self.qk_rope_head_dim,
+                    self.v_head_dim,
+                )
+            # mla_prolog_v3
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                q_lora,
+                forward_batch,
+                positions,
+                dynamic_scale,
+            ) = self.mla_preprocess.forward(positions, hidden_states, forward_batch)
+        return (
+            q_pe,
+            k_pe,
+            q_nope_out,
+            k_nope,
+            q_lora,
+            forward_batch,
+            zero_allocator,
+            positions,
+            dynamic_scale,
         )
 
     def forward(
@@ -2011,43 +2097,21 @@ class DeepseekV2AttentionMLA(nn.Module):
         """
         Reuse `self.q_lora_rank is not None` branch from forward_absorb_prepare
         """
+        dynamic_scale = None
         if self.is_mla_preprocess_enabled and forward_batch.forward_mode.is_decode():
-            if self.mla_preprocess is None:
-                self.mla_preprocess = NPUFusedMLAPreprocess(
-                    self.fused_qkv_a_proj_with_mqa,
-                    self.q_a_layernorm,
-                    self.kv_a_layernorm,
-                    self.q_b_proj,
-                    self.w_kc,
-                    self.rotary_emb,
-                    self.layer_id,
-                    self.num_local_heads,
-                    self.qk_nope_head_dim,
-                    self.qk_rope_head_dim,
-                )
-            indexer_stream = get_indexer_stream()
-            mla_event = torch.npu.Event()
-            mla_event.record()
-            with torch.npu.stream(indexer_stream):
-                torch.npu.current_stream().wait_event(mla_event)
-                (
-                    q_pe,
-                    k_pe,
-                    q_nope_out,
-                    k_nope,
-                    forward_batch,
-                    zero_allocator,
-                    positions,
-                ) = self.mla_preprocess.forward(
-                    positions, hidden_states, forward_batch, zero_allocator
-                )
-
-            fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
-            q, _ = fused_qkv_a_proj_out.split(
-                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+            (
+                q_pe,
+                k_pe,
+                q_nope_out,
+                k_nope,
+                q_lora,
+                forward_batch,
+                zero_allocator,
+                positions,
+                dynamic_scale,
+            ) = self.npu_mla_preprocess(
+                hidden_states, positions, forward_batch, zero_allocator
             )
-            q_lora = self.q_a_layernorm(q)
-            torch.npu.current_stream().wait_stream(indexer_stream)
         else:
             from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -2125,7 +2189,12 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         # TODO: multi-stream indexer
         topk_indices = self.indexer(
-            hidden_states, q_lora, positions, forward_batch, self.layer_id
+            hidden_states,
+            q_lora,
+            positions,
+            forward_batch,
+            self.layer_id,
+            dynamic_scale,
         )
 
         return (

@@ -953,9 +953,14 @@ class NPU_W8A8DynamicLinearMethodImpl:
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
         tp_rank: Optional[int] = 0,
+        dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         original_dtype = x.dtype
-        quant_out, dynamic_scale = torch_npu.npu_dynamic_quant(x)
+        if dynamic_scale is not None:
+            quant_out = x
+            original_dtype = torch.bfloat16
+        else:
+            quant_out, dynamic_scale = torch_npu.npu_dynamic_quant(x)
         return torch_npu.npu_quant_matmul(
             quant_out,
             layer.weight,
@@ -1037,8 +1042,9 @@ class NPU_W8A8DynamicLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        return self.quant_method.apply(layer, x, bias)
+        return self.quant_method.apply(layer, x, bias, dynamic_scale=dynamic_scale)
 
 
 class NPU_W8A8MoEMethod(FusedMoEMethodBase):

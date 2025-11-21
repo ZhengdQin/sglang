@@ -114,6 +114,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         if use_intel_amx_backend(layer):
             x_shapes = x.shape
