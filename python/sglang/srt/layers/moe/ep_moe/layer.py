@@ -111,6 +111,7 @@ class DeepEPMoE(FusedMoE):
             self.use_w4afp8 = False
 
         self.deepep_mode = get_deepep_mode()
+        self.enable_fused_moe = get_bool_env_var("ENABLE_FUSED_MOE")
 
         if (
             self.deepep_mode.enable_low_latency()
@@ -147,6 +148,19 @@ class DeepEPMoE(FusedMoE):
         alt_stream=None,
         disable_sbo=False,
     ):
+        if self.deepep_mode.is_low_latency() and self.enable_fused_moe:
+            topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+            hidden_states = self.fused_moe(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                self.w13_weight,
+                self.w13_weight_scale,
+                self.w2_weight,
+                self.w2_weight_scale,
+                quant_mode=1,
+            )
+            return hidden_states
 
         if self.deprecate_flag:
             assert forward_shared_experts is None
@@ -175,6 +189,28 @@ class DeepEPMoE(FusedMoE):
         return self.dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_output=topk_output,
+        )
+
+    def fused_moe(
+        self,
+        hidden_states: torch.Tensor,
+        topk_idx: torch.Tensor,
+        topk_weights: torch.Tensor,
+        gmm1_permuted_weight: torch.Tensor,
+        gmm1_permuted_weight_scale: torch.Tensor,
+        gmm2_weight: torch.Tensor,
+        gmm2_weight_scale: torch.Tensor,
+        quant_mode: int,
+    ):
+        return self.dispatcher.fused_moe(
+            hidden_states=hidden_states,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            gmm1_permuted_weight=gmm1_permuted_weight,
+            gmm1_permuted_weight_scale=gmm1_permuted_weight_scale,
+            gmm2_weight=gmm2_weight,
+            gmm2_weight_scale=gmm2_weight_scale,
+            quant_mode=quant_mode,
         )
 
     def run_moe_core(
