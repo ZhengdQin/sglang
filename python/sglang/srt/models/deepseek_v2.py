@@ -1423,6 +1423,7 @@ class DeepseekV2AttentionMLA(nn.Module):
     def npu_mla_preprocess(
         self, hidden_states, positions, forward_batch, zero_allocator
     ):
+        dynamic_scale = None
         if not self.is_mla_prolog_enabled:
             if self.mla_preprocess is None:
                 self.mla_preprocess = NPUFusedMLAPreprocess(
@@ -2098,7 +2099,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         Reuse `self.q_lora_rank is not None` branch from forward_absorb_prepare
         """
         dynamic_scale = None
-        if self.is_mla_preprocess_enabled and forward_batch.forward_mode.is_decode():
+        if self.is_mla_preprocess_enabled and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_target_verify()
+        ):
             (
                 q_pe,
                 k_pe,

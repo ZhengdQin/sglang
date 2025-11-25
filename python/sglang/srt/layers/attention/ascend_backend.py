@@ -361,7 +361,11 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled():
+        if is_mla_preprocess_enabled() and (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:
