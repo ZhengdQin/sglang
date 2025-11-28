@@ -713,9 +713,8 @@ class ForwardBatch:
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
             if cp_size > 1:
-                global_num_tokens[i] = (
-                    (global_num_tokens[i] - 1) // tp_size + 1
-                ) * tp_size
+                m = tp_size * cp_size * 2
+                global_num_tokens[i] = (global_num_tokens[i] + m - 1) // m * m
             else:
                 global_num_tokens[i] = (
                     (global_num_tokens[i] - 1) // attn_tp_size + 1

@@ -42,6 +42,7 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV3ForCausalLM,
     enable_nextn_moe_bf16_cast_to_fp8,
 )
+from sglang.srt.models.utils import prepare_input_cp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
 
@@ -118,6 +119,7 @@ class DeepseekModelNextN(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        cp_input_dict: Optional[dict] = None,
     ) -> torch.Tensor:
         zero_allocator = BumpAllocator(
             buffer_size=2,
@@ -146,7 +148,12 @@ class DeepseekModelNextN(nn.Module):
         residual = None
         with get_global_expert_distribution_recorder().disable_this_region():
             hidden_states, residual = self.decoder(
-                positions, hidden_states, forward_batch, residual, zero_allocator
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                cp_input_dict=cp_input_dict,
             )
 
         if not forward_batch.forward_mode.is_idle():
@@ -194,16 +201,48 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         cp_size = get_context_model_parallel_world_size()
+        cp_input_dict = None
         if cp_size > 1:
-            cp_rank = get_context_model_parallel_rank()
-            input_ids = input_ids.tensor_split(cp_size)[cp_rank]
-            forward_batch.spec_info.hidden_states = (
-                forward_batch.spec_info.hidden_states.tensor_split(cp_size)[cp_rank]
-            )
+            if get_global_server_args().cp_balance:
+                cp_input_dict = prepare_input_cp(
+                    torch.tensor(
+                        [len(input_ids)], device=input_ids.device, dtype=torch.int32
+                    )
+                )
+                input_ids_list = list(
+                    torch.split(input_ids, cp_input_dict["split_list"], dim=0)
+                )
+                input_ids = torch.cat(
+                    [input_ids_list[i] for i in cp_input_dict["zigzag_index"]], dim=0
+                )
 
-        hidden_states = self.model(input_ids, positions, forward_batch)
+                spec_hidden_states_list = list(
+                    torch.split(
+                        forward_batch.spec_info.hidden_states,
+                        cp_input_dict["split_list"],
+                        dim=0,
+                    )
+                )
+                forward_batch.spec_info.hidden_states = torch.cat(
+                    [spec_hidden_states_list[i] for i in cp_input_dict["zigzag_index"]],
+                    dim=0,
+                ).view(-1, forward_batch.spec_info.hidden_states.shape[-1])
+            else:
+                cp_rank = get_context_model_parallel_rank()
+                input_ids = input_ids.tensor_split(cp_size)[cp_rank]
+                forward_batch.spec_info.hidden_states = (
+                    forward_batch.spec_info.hidden_states.tensor_split(cp_size)[cp_rank]
+                )
+
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, cp_input_dict=cp_input_dict
+        )
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            cp_input_dict=cp_input_dict,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

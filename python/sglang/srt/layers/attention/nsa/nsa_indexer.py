@@ -183,6 +183,7 @@ class Indexer(CustomOp):
         self.softmax_scale = self.head_dim**-0.5
         self.cp_size = get_context_model_parallel_world_size()
         self.cp_rank = get_context_model_parallel_rank()
+        self.cp_balance = get_global_server_args().cp_balance
         self.attention_tp_rank = get_attention_tp_rank()
         self.attention_tp_size = get_attention_tp_size()
 
@@ -702,6 +703,7 @@ class Indexer(CustomOp):
         forward_batch: ForwardBatch,
         layer_id: int,
         dynamic_scale: torch.Tensor = None,
+        cp_input_dict: Optional[dict] = None,
     ) -> torch.Tensor:
         if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = forward_batch.attn_backend.forward_metadata.seq_lens
@@ -800,6 +802,14 @@ class Indexer(CustomOp):
                 get_attention_tp_group().all_gather_into_tensor(k, local_k)
             if self.cp_size > 1:
                 k = context_model_parallel_all_gather(k, 0)
+                if self.cp_balance:
+                    output_list = list(
+                        torch.split(k, cp_input_dict["reverse_split_list"], dim=0)
+                    )
+                    k = torch.cat(
+                        [output_list[i] for i in cp_input_dict["cp_reverse_index"]],
+                        dim=0,
+                    )
 
         forward_batch.token_to_kv_pool.set_index_k_buffer(
             layer_id, forward_batch.out_cache_loc, k
@@ -875,18 +885,30 @@ class Indexer(CustomOp):
             block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table
         )
 
-        topk_indices = torch.ops.custom.npu_lightning_indexer(
-            query=q.view(-1, self.n_heads, self.head_dim),
-            key=past_key_states,
-            weights=weights,
-            actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
-            actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(torch.int32),
-            block_table=block_table,
-            layout_query="TND",
-            layout_key="PA_BSND",
-            sparse_count=self.index_topk,
-            sparse_mode=3,
-        )
+        if is_prefill and self.cp_size > 1 and self.cp_balance:
+            topk_indices = self.do_npu_cp_balance_indexer(
+                q.view(-1, self.n_heads, self.head_dim),
+                past_key_states,
+                weights,
+                actual_seq_lengths_q,
+                actual_seq_lengths_kv,
+                block_table,
+            )
+        else:
+            topk_indices = torch.ops.custom.npu_lightning_indexer(
+                query=q.view(-1, self.n_heads, self.head_dim),
+                key=past_key_states,
+                weights=weights,
+                actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
+                actual_seq_lengths_key=actual_seq_lengths_kv.to(k.device).to(
+                    torch.int32
+                ),
+                block_table=block_table,
+                layout_query="TND",
+                layout_key="PA_BSND",
+                sparse_count=self.index_topk,
+                sparse_mode=3,
+            )
 
         if is_prefill and enable_index_cp:
             topk_indices, local_topk_indices = (
@@ -904,5 +926,59 @@ class Indexer(CustomOp):
             get_attention_tp_group().all_gather_into_tensor(
                 topk_indices, local_topk_indices
             )
-
         return topk_indices
+
+    def do_npu_cp_balance_indexer(
+        self,
+        q,
+        past_key_states,
+        indexer_weights,
+        actual_seq_lengths_q,
+        actual_seq_lengths_kv,
+        block_table,
+    ):
+        q_prev, q_next = torch.split(q, q.size(0) // 2, dim=0)
+        weights_prev, weights_next = None, None
+        if indexer_weights is not None:
+            weights_prev, weights_next = torch.split(
+                indexer_weights, indexer_weights.size(0) // 2, dim=0
+            )
+            weights_prev = weights_prev.contiguous().view(-1, weights_prev.shape[-1])
+            weights_next = weights_next.contiguous().view(-1, weights_next.shape[-1])
+
+        actual_seq_lengths_q_prev, actual_seq_lengths_q_next = actual_seq_lengths_q
+        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+
+        topk_indices_prev = torch.ops.custom.npu_lightning_indexer(
+            query=q_prev,
+            key=past_key_states,
+            weights=weights_prev,
+            actual_seq_lengths_query=actual_seq_lengths_q_prev.to(
+                device=q.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_key=actual_seq_lengths_kv_prev.to(
+                device=q.device, dtype=torch.int32
+            ),
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=self.index_topk,
+            sparse_mode=3,
+        )
+        topk_indices_next = torch.ops.custom.npu_lightning_indexer(
+            query=q_next,
+            key=past_key_states,
+            weights=weights_next,
+            actual_seq_lengths_query=actual_seq_lengths_q_next.to(
+                device=q.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_key=actual_seq_lengths_kv_next.to(
+                device=q.device, dtype=torch.int32
+            ),
+            block_table=block_table,
+            layout_query="TND",
+            layout_key="PA_BSND",
+            sparse_count=self.index_topk,
+            sparse_mode=3,
+        )
+        return topk_indices_prev, topk_indices_next

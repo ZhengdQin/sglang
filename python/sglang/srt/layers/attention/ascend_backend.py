@@ -116,6 +116,7 @@ class AscendAttnBackend(AttentionBackend):
         self.mtp_mask = torch.tril(torch.ones(2048, 2048, dtype=torch.bool)).npu()
         self.mtp_mask = ~self.mtp_mask
         self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
+        self.cp_balance = model_runner.cp_balance
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -157,18 +158,52 @@ class AscendAttnBackend(AttentionBackend):
                 cp_size = get_context_model_parallel_world_size()
                 cp_rank = get_context_model_parallel_rank()
                 if cp_size > 1:
-                    rank_offset = cp_rank
-                    bsz = forward_batch.input_ids.numel() // cp_size  # q_nope.shape[0]
-                    actual_seq_qlen -= bsz * rank_offset
-                    actual_seq_qlen.clip_(min=0, max=bsz)
+                    if self.cp_balance:
+                        bsz_cp = forward_batch.input_ids.numel() // cp_size // 2
+                        actual_seq_qlen_prev = (
+                            actual_seq_qlen - bsz_cp * cp_rank
+                        ).clip_(min=0, max=bsz_cp)
+                        actual_seq_qlen_next = (
+                            actual_seq_qlen - bsz_cp * (cp_size * 2 - cp_rank - 1)
+                        ).clip_(min=0, max=bsz_cp)
+                        actual_seq_qlen = (actual_seq_qlen_prev, actual_seq_qlen_next)
 
-                    total_num = bsz * (rank_offset + 1)
-                    for i in range(len(actual_seq_lengths_kv)):
-                        if total_num <= actual_seq_lengths_kv[i]:
-                            actual_seq_lengths_kv[i] = total_num
-                            total_num = 0
-                        else:
-                            total_num -= actual_seq_lengths_kv[i]
+                        total_num_prev = bsz_cp * (cp_rank + 1)
+                        actual_seq_lengths_kv_prev = actual_seq_lengths_kv.clone()
+                        for i in range(len(actual_seq_lengths_kv_prev)):
+                            if total_num_prev <= actual_seq_lengths_kv_prev[i]:
+                                actual_seq_lengths_kv_prev[i] = total_num_prev
+                                total_num_prev = 0
+                            else:
+                                total_num_prev -= actual_seq_lengths_kv_prev[i]
+
+                        total_num_next = bsz_cp * (cp_size * 2 - cp_rank)
+                        actual_seq_lengths_kv_next = actual_seq_lengths_kv.clone()
+                        for i in range(len(actual_seq_lengths_kv_next)):
+                            if total_num_next <= actual_seq_lengths_kv_next[i]:
+                                actual_seq_lengths_kv_next[i] = total_num_next
+                                total_num_next = 0
+                            else:
+                                total_num_next -= actual_seq_lengths_kv_next[i]
+                        actual_seq_lengths_kv = (
+                            actual_seq_lengths_kv_prev,
+                            actual_seq_lengths_kv_next,
+                        )
+                    else:
+                        rank_offset = cp_rank
+                        bsz = (
+                            forward_batch.input_ids.numel() // cp_size
+                        )  # q_nope.shape[0]
+                        actual_seq_qlen -= bsz * rank_offset
+                        actual_seq_qlen.clip_(min=0, max=bsz)
+
+                        total_num = bsz * (rank_offset + 1)
+                        for i in range(len(actual_seq_lengths_kv)):
+                            if total_num <= actual_seq_lengths_kv[i]:
+                                actual_seq_lengths_kv[i] = total_num
+                                total_num = 0
+                            else:
+                                total_num -= actual_seq_lengths_kv[i]
                 self.forward_metadata.actual_seq_lengths_q = actual_seq_qlen
                 self.forward_metadata.actual_seq_lengths_kv = (
                     actual_seq_lengths_kv  # self.forward_metadata.seq_lens_cpu_int
@@ -261,6 +296,71 @@ class AscendAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return 0
 
+    def do_cp_balance_attn(
+        self,
+        q_nope,
+        k_nope,
+        q_pe,
+        k_pe,
+        topk_indices,
+        layer,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
+        seq_len = q_nope.shape[0]
+        q_nope_prev, q_nope_next = torch.split(q_nope, seq_len // 2, dim=0)
+        q_rope_prev, q_rope_next = torch.split(q_pe, seq_len // 2, dim=0)
+        q_nope_prev = q_nope_prev.contiguous()
+        q_nope_next = q_nope_next.contiguous()
+        q_rope_prev = q_rope_prev.contiguous()
+        q_rope_next = q_rope_next.contiguous()
+        topk_indices_prev, topk_indices_next = topk_indices
+
+        actual_seq_qlen_prev, actual_seq_qlen_next = actual_seq_qlen
+        actual_seq_lengths_kv_prev, actual_seq_lengths_kv_next = actual_seq_lengths_kv
+
+        attn_out_prev = torch.ops.custom.npu_sparse_flash_attention(
+            query=q_nope_prev,
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_rope_prev,
+            key_rope=k_pe,
+            sparse_indices=topk_indices_prev,
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen_prev.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv_prev.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            block_table=self.forward_metadata.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+        )
+        attn_out_next = torch.ops.custom.npu_sparse_flash_attention(
+            query=q_nope_next,
+            key=k_nope,
+            value=k_nope,
+            query_rope=q_rope_next,
+            key_rope=k_pe,
+            sparse_indices=topk_indices_next,
+            scale_value=layer.scaling,
+            actual_seq_lengths_query=actual_seq_qlen_next.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv_next.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            block_table=self.forward_metadata.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+        )
+        return torch.cat([attn_out_prev, attn_out_next], dim=0)
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -334,22 +434,35 @@ class AscendAttnBackend(AttentionBackend):
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
-        attn_out = torch.ops.custom.npu_sparse_flash_attention(
-            query=q_nope,
-            key=k_nope,
-            value=k_nope,
-            query_rope=q_pe,
-            key_rope=k_pe,
-            sparse_indices=topk_indices,
-            scale_value=layer.scaling,
-            actual_seq_lengths_query=actual_seq_qlen,
-            actual_seq_lengths_kv=actual_seq_lengths_kv.to(q.device),
-            block_table=self.forward_metadata.block_tables,
-            sparse_block_size=1,
-            layout_query="TND",
-            layout_kv="PA_BSND",
-            sparse_mode=3,
-        )
+        cp_size = get_context_model_parallel_world_size()
+        if is_prefill and cp_size > 1 and self.cp_balance:
+            attn_out = self.do_cp_balance_attn(
+                q_nope,
+                k_nope,
+                q_pe,
+                k_pe,
+                topk_indices,
+                layer,
+                actual_seq_qlen,
+                actual_seq_lengths_kv,
+            )
+        else:
+            attn_out = torch.ops.custom.npu_sparse_flash_attention(
+                query=q_nope,
+                key=k_nope,
+                value=k_nope,
+                query_rope=q_pe,
+                key_rope=k_pe,
+                sparse_indices=topk_indices,
+                scale_value=layer.scaling,
+                actual_seq_lengths_query=actual_seq_qlen,
+                actual_seq_lengths_kv=actual_seq_lengths_kv.to(q.device),
+                block_table=self.forward_metadata.block_tables,
+                sparse_block_size=1,
+                layout_query="TND",
+                layout_kv="PA_BSND",
+                sparse_mode=3,
+            )
 
         return attn_out
 

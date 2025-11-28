@@ -343,6 +343,7 @@ class ServerArgs:
 
     # Context parallelism
     cp_size: int = 1
+    cp_balance: Optional[bool] = False
 
     # Multi-node distributed serving
     dist_init_addr: Optional[str] = None
@@ -2563,6 +2564,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.cp_size,
             help="The context parallelism size.",
+        )
+
+        # Context parallelism balance
+        parser.add_argument(
+            "--cp-balance",
+            action="store_true",
+            default=ServerArgs.cp_balance,
+            help="The context parallelism calculation load will be balanced across ranks in cp group.",
         )
 
         # Multi-node distributed serving

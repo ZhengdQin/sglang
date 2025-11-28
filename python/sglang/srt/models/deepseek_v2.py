@@ -121,6 +121,7 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
 )
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import prepare_input_cp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.single_batch_overlap import SboFlags
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -1156,6 +1157,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.attn_tp_size = attn_tp_size
         self.cp_size = get_context_model_parallel_world_size()
         self.cp_rank = get_context_model_parallel_rank()
+        self.cp_balance = get_global_server_args().cp_balance
 
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
@@ -1510,12 +1512,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        cp_input_dict: Optional[dict] = None,
     ):
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            cp_input_dict=cp_input_dict,
         )
         return self.forward_core(s)
 
@@ -1525,6 +1529,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        cp_input_dict: Optional[dict] = None,
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1562,8 +1567,22 @@ class DeepseekV2AttentionMLA(nn.Module):
             if is_prefill:
                 assert not (enable_index_cp and self.cp_size > 1)
                 if self.cp_size > 1:
-                    cos = cos.tensor_split(self.cp_size)[self.cp_rank]
-                    sin = sin.tensor_split(self.cp_size)[self.cp_rank]
+                    if self.cp_balance:
+                        cos_list = list(
+                            torch.split(cos, cp_input_dict["split_list"], dim=0)
+                        )
+                        sin_list = list(
+                            torch.split(sin, cp_input_dict["split_list"], dim=0)
+                        )
+                        cos = torch.cat(
+                            [cos_list[i] for i in cp_input_dict["zigzag_index"]], dim=0
+                        )
+                        sin = torch.cat(
+                            [sin_list[i] for i in cp_input_dict["zigzag_index"]], dim=0
+                        )
+                    else:
+                        cos = cos.tensor_split(self.cp_size)[self.cp_rank]
+                        sin = sin.tensor_split(self.cp_size)[self.cp_rank]
                 if enable_index_cp:
                     slice_length = cos.shape[0] // self.attention_tp_size
                     cos = cos[
@@ -1585,6 +1604,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 hidden_states,
                 forward_batch,
                 zero_allocator,
+                cp_input_dict,
             )
         elif attn_forward_method == AttnForwardMethod.MHA_CHUNKED_KV:
             inner_state = self.forward_normal_chunked_kv_prepare(
@@ -1624,6 +1644,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 hidden_states,
                 forward_batch,
                 zero_allocator,
+                cp_input_dict=cp_input_dict,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
@@ -1686,6 +1707,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        cp_input_dict: Optional[dict] = None,
     ):
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
@@ -1700,6 +1722,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                     latent_cache = context_model_parallel_all_gather(
                         latent_cache.contiguous(), dim=0
                     )
+
                 q = self.q_b_proj(q_lora)[0].view(
                     -1, self.num_local_heads, self.qk_head_dim
                 )
@@ -1733,6 +1756,19 @@ class DeepseekV2AttentionMLA(nn.Module):
                     latent_cache = context_model_parallel_all_gather(
                         latent_cache.contiguous(), dim=0
                     )
+                    if self.cp_balance:
+                        latent_cache_seg = list(
+                            torch.split(
+                                latent_cache, cp_input_dict["split_list"], dim=0
+                            )
+                        )
+                        latent_cache = torch.cat(
+                            [
+                                latent_cache_seg[i]
+                                for i in cp_input_dict["cp_reverse_index"]
+                            ],
+                            dim=0,
+                        )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
 
         else:
@@ -1814,6 +1850,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        cp_input_dict: Optional[dict] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -1963,6 +2000,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 positions=positions,
                 forward_batch=forward_batch,
                 layer_id=self.layer_id,
+                cp_input_dict=cp_input_dict,
             )
 
         return (
@@ -2129,6 +2167,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        cp_input_dict: Optional[dict] = None,
     ):
         """
         Reuse `self.q_lora_rank is not None` branch from forward_absorb_prepare
@@ -2174,6 +2213,18 @@ class DeepseekV2AttentionMLA(nn.Module):
                 latent_cache = context_model_parallel_all_gather(
                     latent_cache.contiguous(), dim=0
                 )
+                if self.cp_balance:
+                    latent_cache_seg = list(
+                        torch.split(latent_cache, cp_input_dict["split_list"], dim=0)
+                    )
+                    latent_cache = torch.cat(
+                        [
+                            latent_cache_seg[i]
+                            for i in cp_input_dict["cp_reverse_index"]
+                        ],
+                        dim=0,
+                    )
+
             k_nope, k_pe = latent_cache.unsqueeze(1).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
@@ -2235,6 +2286,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             forward_batch,
             self.layer_id,
             dynamic_scale,
+            cp_input_dict,
         )
 
         return (
@@ -2895,6 +2947,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
+        cp_input_dict: Optional[dict] = None,
     ) -> torch.Tensor:
         quant_format = (
             "mxfp4"
@@ -2935,6 +2988,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
+            cp_input_dict=cp_input_dict,
         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
@@ -3151,6 +3205,7 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        cp_input_dict: Optional[dict] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
         device = input_embeds.device if input_embeds is not None else input_ids.device
@@ -3209,6 +3264,7 @@ class DeepseekV2Model(nn.Module):
                     residual,
                     zero_allocator,
                     gemm_output_zero_allocator,
+                    cp_input_dict=cp_input_dict,
                 )
 
         if normal_end_layer != self.end_layer:
@@ -3342,12 +3398,31 @@ class DeepseekV2ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         cp_size = get_context_model_parallel_world_size()
+        cp_input_dict = None
         if cp_size > 1:
-            cp_rank = get_context_model_parallel_rank()
-            input_ids = input_ids.tensor_split(cp_size)[cp_rank]
+            if get_global_server_args().cp_balance:
+                cp_input_dict = prepare_input_cp(
+                    torch.tensor(
+                        [len(input_ids)], device=input_ids.device, dtype=torch.int32
+                    )
+                )
+                input_ids_list = list(
+                    torch.split(input_ids, cp_input_dict["split_list"], dim=0)
+                )
+                input_ids = torch.cat(
+                    [input_ids_list[i] for i in cp_input_dict["zigzag_index"]], dim=0
+                )
+            else:
+                cp_rank = get_context_model_parallel_rank()
+                input_ids = input_ids.tensor_split(cp_size)[cp_rank]
 
         hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+            cp_input_dict=cp_input_dict,
         )
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -3355,7 +3430,12 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
+                cp_input_dict=cp_input_dict,
             )
         else:
             return hidden_states

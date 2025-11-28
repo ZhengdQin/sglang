@@ -271,6 +271,7 @@ class ModelRunner:
         self.pp_size = pp_size
         self.cp_rank = cp_rank
         self.cp_size = cp_size
+        self.cp_balance = server_args.cp_balance
         self.model_config = model_config
         self.dist_port = nccl_port
         self.server_args = server_args
