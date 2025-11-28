@@ -374,6 +374,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
         aux_hidden_states: Optional[torch.Tensor] = None,
+        cp_input_dict: Optional[dict] = None,
     ) -> LogitsProcessorOutput:
         if isinstance(logits_metadata, ForwardBatch):
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
@@ -403,6 +404,16 @@ class LogitsProcessor(nn.Module):
             # Prefill without input logprobs.
             if get_context_model_parallel_world_size() > 1:
                 hidden_states = context_model_parallel_all_gather(hidden_states, 0)
+                if get_global_server_args().cp_balance:
+                    h = hidden_states.shape[-1]
+                    output_list = list(
+                        torch.split(
+                            hidden_states, cp_input_dict["reverse_split_list"], dim=0
+                        )
+                    )
+                    hidden_states = torch.cat(
+                        [output_list[i] for i in cp_input_dict["cp_reverse_index"]]
+                    ).view(-1, h)
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             elif logits_metadata.padded_static_len < 0:
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
