@@ -2276,7 +2276,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             )
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
             q_nope_out = q_nope_out.transpose(0, 1)
-            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+            q_pe, k_pe = self.rotary_emb(
+                positions, q_pe, k_pe, cp_input_dict=cp_input_dict
+            )
 
         # TODO: multi-stream indexer
         topk_indices = self.indexer(

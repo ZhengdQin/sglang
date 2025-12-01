@@ -771,6 +771,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         if _is_hip:
             self._forward_method = self.forward_native
 
+        self.cp_balance = get_global_server_args().cp_balance
+
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
         pos_freqs = self.base ** (
             torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=self.device)
@@ -858,6 +860,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
+        cp_input_dict: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         num_tokens, num_q_heads, _ = query.shape
         num_k_heads = key.shape[1]
@@ -879,8 +882,18 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         if positions.numel() != num_tokens:
             cp_size = get_context_model_parallel_world_size()
             cp_rank = get_context_model_parallel_rank()
-            cos_split = cos.tensor_split(cp_size)[cp_rank]
-            sin_split = sin.tensor_split(cp_size)[cp_rank]
+            if self.cp_balance:
+                cos_list = list(torch.split(cos, cp_input_dict["split_list"], dim=0))
+                sin_list = list(torch.split(sin, cp_input_dict["split_list"], dim=0))
+                cos_split = torch.cat(
+                    [cos_list[i] for i in cp_input_dict["zigzag_index"]], dim=0
+                )
+                sin_split = torch.cat(
+                    [sin_list[i] for i in cp_input_dict["zigzag_index"]], dim=0
+                )
+            else:
+                cos_split = cos.tensor_split(cp_size)[cp_rank]
+                sin_split = sin.tensor_split(cp_size)[cp_rank]
         else:
             cos_split, sin_split = cos, sin
         query_rot = torch_npu.npu_interleave_rope(

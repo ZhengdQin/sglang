@@ -881,11 +881,13 @@ class Indexer(CustomOp):
             weights = indexer_weights
 
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
-        block_table = (
-            block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table
-        )
 
         if is_prefill and self.cp_size > 1 and self.cp_balance:
+            block_table = (
+                block_table[: actual_seq_lengths_q[0].size()[0]]
+                if is_prefill
+                else block_table
+            )
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
                 past_key_states,
@@ -895,6 +897,11 @@ class Indexer(CustomOp):
                 block_table,
             )
         else:
+            block_table = (
+                block_table[: actual_seq_lengths_q.size()[0]]
+                if is_prefill
+                else block_table
+            )
             topk_indices = torch.ops.custom.npu_lightning_indexer(
                 query=q.view(-1, self.n_heads, self.head_dim),
                 key=past_key_states,
