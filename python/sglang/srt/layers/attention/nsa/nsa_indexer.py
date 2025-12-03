@@ -947,6 +947,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
         import custom_ops  # noqa: F401
         import torch_npu
@@ -998,7 +999,9 @@ class Indexer(CustomOp):
 
         bs = x.shape[0]
 
-        q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+        q = self.wq_b(q_lora, dynamic_scale)[
+            0
+        ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
         q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
         q_pe, q_nope = torch.split(
             q,
@@ -1091,7 +1094,8 @@ class Indexer(CustomOp):
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
 
         x = x.view(-1, self.hidden_size)
-        weights = self.weights_proj(x.float())[0]
+        # weights = self.weights_proj(x.float())[0]
+        weights = self.weights_proj(x)[0]
         block_table = (
             block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table
         )

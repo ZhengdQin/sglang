@@ -628,6 +628,7 @@ def make_layers_non_pp(
 
 
 cmo_stream = None
+indexer_stream = None
 
 
 def get_cmo_stream():
@@ -643,6 +644,15 @@ def get_cmo_stream():
 def set_cmo_stream(stream):
     global cmo_stream
     cmo_stream = stream
+
+
+def get_indexer_stream(device="cuda"):
+    if is_npu():
+        device = "npu"
+    global get_indexer_stream
+    if indexer_stream is None:
+        indexer_stream = torch.get_device_module(device).Stream()
+    return indexer_stream
 
 
 def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
