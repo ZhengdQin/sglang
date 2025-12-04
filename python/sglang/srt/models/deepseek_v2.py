@@ -149,8 +149,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cmo_stream,
     get_device_sm,
-    get_indexer_stream,
     get_int_env_var,
+    get_shared_stream,
     is_cpu,
     is_cuda,
     is_gfx95_supported,
@@ -989,12 +989,12 @@ class DeepseekV2MoE(nn.Module):
                     # prefetch and forward share experts on the same stream
                     main_event = torch.npu.Event()
                     main_event.record()
-                    indexer_stream = get_indexer_stream()
-                    with torch.npu.stream(indexer_stream):
-                        indexer_stream.wait_event(main_event)
+                    shared_stream = get_shared_stream()
+                    with torch.npu.stream(shared_stream):
+                        shared_stream.wait_event(main_event)
                         shared_output = self._forward_shared_experts(hidden_states)
-                        shared_output.record_stream(indexer_stream)
-                        shared_event = indexer_stream.record_event()
+                        shared_output.record_stream(shared_stream)
+                        shared_event = shared_stream.record_event()
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
@@ -1269,6 +1269,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        self.alt_stream = alt_stream
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
@@ -2197,10 +2198,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.qk_nope_head_dim,
                     self.qk_rope_head_dim,
                 )
-            indexer_stream = get_indexer_stream()
+
             mla_event = torch.npu.Event()
             mla_event.record()
-            with torch.npu.stream(indexer_stream):
+            with torch.npu.stream(self.alt_stream):
                 torch.npu.current_stream().wait_event(mla_event)
                 (
                     q_pe,
@@ -2219,19 +2220,9 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             q_lora = self.q_a_layernorm(q)
-            torch.npu.current_stream().wait_stream(indexer_stream)
+            torch.npu.current_stream().wait_stream(self.alt_stream)
         else:
-
-            if (
-                (not isinstance(hidden_states, tuple))
-                and hidden_states.shape[0] <= 16
-                and self.use_min_latency_fused_a_gemm
-            ):
-                fused_qkv_a_proj_out = dsv3_fused_a_gemm(
-                    hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
-                )
-            else:
-                fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+            fused_qkv_a_proj_out = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
@@ -2241,13 +2232,12 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             q_lora = q.clone()  # required for topk_indices
 
-            indexer_stream = get_indexer_stream()
-            indexer_stream.wait_stream(torch.npu.current_stream())
-            with torch.npu.stream(indexer_stream):
+            shared_stream = get_shared_stream()
+            shared_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(shared_stream):
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-
-                q.record_stream(indexer_stream)
-                q_event = indexer_stream.record_event()
+                q.record_stream(shared_stream)
+                q_event = shared_stream.record_event()
 
             k_nope, k_pe = latent_cache.unsqueeze(1).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
@@ -2258,71 +2248,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
-
-            if self.use_deep_gemm_bmm:
-                q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
-                    per_token_group_quant_mla_deep_gemm_masked_fp8(
-                        q_nope.transpose(0, 1)
-                    )
-                )
-                q_nope_out = q_nope.new_empty(
-                    (self.num_local_heads, aligned_m, self.kv_lora_rank)
-                )
-                deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
-                    (q_nope_val, q_nope_scale),
-                    (self.w_kc, self.w_scale_k),
-                    q_nope_out,
-                    masked_m,
-                    expected_m,
-                )
-                q_nope_out = q_nope_out[:, :expected_m, :]
-            elif _is_hip:
-                # TODO(haishaw): add bmm_fp8 to ROCm
-                if _use_aiter_gfx95 and self.w_kc.dtype == torch.uint8:
-                    x = q_nope.transpose(0, 1)
-                    q_nope_out = torch.empty(
-                        x.shape[0],
-                        x.shape[1],
-                        self.w_kc.shape[2],
-                        device=x.device,
-                        dtype=torch.bfloat16,
-                    )
-                    batched_gemm_afp4wfp4_pre_quant(
-                        x,
-                        self.w_kc.transpose(-2, -1),
-                        self.w_scale_k.transpose(-2, -1),
-                        torch.bfloat16,
-                        q_nope_out,
-                    )
-                else:
-                    if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
-
-                        q_nope_out = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
-                            X=q_nope,
-                            WQ=self.w_kc.transpose(-1, -2),
-                            w_scale=self.w_scale,  #
-                            group_size=128,
-                            YQ=None,  # allocate (B, M, N)
-                            transpose_bm=False,  # (B, M, N)
-                            transpose_bm_in=True,  # (M, B, K)
-                            dtype=torch.bfloat16,
-                        )
-                    else:
-                        q_nope_out = torch.bmm(
-                            q_nope.to(torch.bfloat16).transpose(0, 1),
-                            self.w_kc.to(torch.bfloat16) * self.w_scale,
-                        )
-            elif self.w_kc.dtype == torch.float8_e4m3fn:
-                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                    q_nope.transpose(0, 1),
-                    zero_allocator.allocate(1),
-                )
-                q_nope_out = bmm_fp8(
-                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-                )
-            else:
-                q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
             q_nope_out = q_nope_out.transpose(0, 1)
 
             if not self._fuse_rope_for_trtllm_mla(forward_batch) and (
@@ -2330,7 +2256,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             ):
                 q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
-        # TODO: multi-stream indexer
         topk_indices = self.indexer(
             hidden_states, q_lora, positions, forward_batch, self.layer_id
         )
@@ -3205,7 +3130,13 @@ class DeepseekV2Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        if _is_cuda:
+            self.alt_stream = torch.cuda.Stream()
+        elif _is_npu:
+            self.alt_stream = torch.npu.Stream()
+        else:
+            None
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: DeepseekV2DecoderLayer(

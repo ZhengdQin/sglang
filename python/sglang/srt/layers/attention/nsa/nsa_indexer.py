@@ -12,13 +12,14 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
-    get_indexer_stream,
     get_indexer_weight_stream,
+    get_shared_stream,
     is_cuda,
     is_hip,
     is_npu,
 )
 
+global _use_multi_stream
 _use_multi_stream = get_bool_env_var("USE_MULTI_STREAM", "0")
 
 if is_cuda():
@@ -30,7 +31,6 @@ if is_cuda():
 if is_npu():
     import custom_ops  # noqa: F401
     import torch_npu
-
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
@@ -1007,13 +1007,13 @@ class Indexer(CustomOp):
 
         bs = x.shape[0]
         if _use_multi_stream:
-            indexer_stream = get_indexer_stream()
-            indexer_stream.wait_stream(torch.npu.current_stream())
-            with torch.npu.stream(indexer_stream):
+            shared_stream = get_shared_stream()
+            shared_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(shared_stream):
                 q = self.wq_b(q_lora)[
                     0
                 ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                wq_b_event = indexer_stream.record_event()
+                wq_b_event = shared_stream.record_event()
                 q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
                 q_pe, q_nope = torch.split(
                     q,
@@ -1021,12 +1021,12 @@ class Indexer(CustomOp):
                     dim=-1,
                 )  # [bs, 64, 64 + 64]
                 q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-                q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(
+                q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
                     bs, self.n_heads, self.rope_head_dim
                 )  # [bs, n, d]
                 q = torch.cat([q_pe, q_nope], dim=-1)
-                q.record_stream(indexer_stream)
-                q_rope_event = indexer_stream.record_event()
+                q.record_stream(shared_stream)
+                q_rope_event = shared_stream.record_event()
         else:
             q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
             q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
@@ -1036,7 +1036,7 @@ class Indexer(CustomOp):
                 dim=-1,
             )  # [bs, 64, 64 + 64]
             q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-            q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
                 bs, self.n_heads, self.rope_head_dim
             )  # [bs, n, d]
             q = torch.cat([q_pe, q_nope], dim=-1)
