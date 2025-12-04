@@ -2215,7 +2215,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_lora = self.q_a_layernorm(q)
             torch.npu.current_stream().wait_event(indexer_stream)
         else:
-            from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
             if (
                 (not isinstance(hidden_states, tuple))
@@ -2230,55 +2229,26 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
+
+            # overlap qk norm
+            q = self.q_a_layernorm(q)
+
+            q_lora = q.clone()  # required for topk_indices
+
+            indexer_stream = get_indexer_stream()
+            indexer_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(indexer_stream):
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+
+                q.record_stream(indexer_stream)
+                q_event = indexer_stream.record_event()
+
             k_nope, k_pe = latent_cache.unsqueeze(1).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
+            k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-            # overlap qk norm
-            if self.alt_stream is not None and get_is_capture_mode():
-                current_stream = torch.cuda.current_stream()
-                self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
-                with torch.cuda.stream(self.alt_stream):
-                    k_nope = self.kv_a_layernorm(k_nope)
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                if _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
-                    q, k_nope, *_ = fused_rms_mxfp4_quant(
-                        q,
-                        self.q_a_layernorm.weight,
-                        self.q_a_layernorm.variance_epsilon,
-                        k_nope,
-                        self.kv_a_layernorm.weight,
-                        self.kv_a_layernorm.variance_epsilon,
-                    )
-                else:
-                    if (
-                        _use_aiter_gfx95
-                        and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
-                    ):
-
-                        q, _, k_nope, _ = fused_rms_fp8_group_quant(
-                            q,
-                            self.q_a_layernorm.weight,
-                            self.q_a_layernorm.variance_epsilon,
-                            k_nope,
-                            self.kv_a_layernorm.weight,
-                            self.kv_a_layernorm.variance_epsilon,
-                            group_size=128,
-                            dtype_quant=torch.float8_e4m3fn,
-                            res1=None,
-                            output_unquantized_inp1=False,
-                        )
-
-                    else:
-                        q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
-
-            q_lora = q.clone()  # required for topk_indices
-            k_nope = k_nope.unsqueeze(1)
-            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-
+            torch.npu.current_stream().wait_event(q_event)
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
