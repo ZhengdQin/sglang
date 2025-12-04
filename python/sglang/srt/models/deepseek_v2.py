@@ -2230,7 +2230,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             q, latent_cache = fused_qkv_a_proj_out.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
-            k_nope = latent_cache[..., : self.kv_lora_rank]
+            k_nope, k_pe = latent_cache.unsqueeze(1).split(
+                [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+            )
 
             # overlap qk norm
             if self.alt_stream is not None and get_is_capture_mode():
@@ -2280,7 +2282,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             q_nope, q_pe = q.split(
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
-            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
             if self.use_deep_gemm_bmm:
                 q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
