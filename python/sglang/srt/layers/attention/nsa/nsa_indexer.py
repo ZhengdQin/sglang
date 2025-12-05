@@ -8,7 +8,19 @@ from einops import rearrange
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.layernorm import LayerNorm
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    ceil_align,
+    get_bool_env_var,
+    get_indexer_weight_stream,
+    get_shared_stream,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
+
+global _use_multi_stream
+_use_multi_stream = get_bool_env_var("USE_MULTI_STREAM", "0")
 
 if is_cuda():
     try:
@@ -16,6 +28,9 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
+if is_npu():
+    import custom_ops  # noqa: F401
+    import torch_npu
 
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import (
@@ -385,12 +400,8 @@ class Indexer(CustomOp):
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens_cpu[i].item()
             assert isinstance(seq_len, int)
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
-                layer_id,
-                seq_len,
-                block_tables[i],
-            )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+            # Use fused Triton kernel to get both K and scale in a single call
+            k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
                 layer_id,
                 seq_len,
                 block_tables[i],
@@ -949,8 +960,6 @@ class Indexer(CustomOp):
         layer_id: int,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        import custom_ops  # noqa: F401
-        import torch_npu
 
         from sglang.srt.layers.dp_attention import (
             get_attention_tp_rank,
@@ -998,22 +1007,51 @@ class Indexer(CustomOp):
         block_table = forward_batch.attn_backend.forward_metadata.block_tables
 
         bs = x.shape[0]
+        if _use_multi_stream:
+            shared_stream = get_shared_stream()
+            shared_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(shared_stream):
+                q = self.wq_b(q_lora)[
+                    0
+                ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+                wq_b_event = shared_stream.record_event()
+                q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+                q_pe, q_nope = torch.split(
+                    q,
+                    [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                    dim=-1,
+                )  # [bs, 64, 64 + 64]
+                q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+                q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+                    bs, self.n_heads, self.rope_head_dim
+                )  # [bs, n, d]
+                q = torch.cat([q_pe, q_nope], dim=-1)
+                q.record_stream(shared_stream)
+                q_rope_event = shared_stream.record_event()
+        else:
+            q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+            q_pe, q_nope = torch.split(
+                q,
+                [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                dim=-1,
+            )  # [bs, 64, 64 + 64]
+            q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
+            q_pe = torch_npu.npu_rotary_mul(q_pe, cos, sin).view(
+                bs, self.n_heads, self.rope_head_dim
+            )  # [bs, n, d]
+            q = torch.cat([q_pe, q_nope], dim=-1)
 
-        q = self.wq_b(q_lora, dynamic_scale)[
-            0
-        ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-        q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
-        q_pe, q_nope = torch.split(
-            q,
-            [self.rope_head_dim, self.head_dim - self.rope_head_dim],
-            dim=-1,
-        )  # [bs, 64, 64 + 64]
-
-        q_pe = q_pe.view(bs, self.n_heads, 1, self.rope_head_dim)
-        q_pe = torch_npu.npu_interleave_rope(q_pe, cos, sin).view(
-            bs, self.n_heads, self.rope_head_dim
-        )  # [bs, n, d]
-        q = torch.cat([q_pe, q_nope], dim=-1)
+        if _use_multi_stream:
+            indexer_weight_stream = get_indexer_weight_stream()
+            indexer_weight_stream.wait_stream(torch.npu.current_stream())
+            indexer_weight_stream.wait_event(wq_b_event)
+            with torch.npu.stream(indexer_weight_stream):
+                indexer_weights = self.weights_proj(x)[0]
+                indexer_weights.record_stream(indexer_weight_stream)
+                weights_event = indexer_weight_stream.record_event()
+        else:
+            indexer_weights = None
 
         k_proj = self.wk(x)[0]  # [b, s, 7168] @ [7168, 128] = [b, s, 128]
         k = self.k_norm(k_proj)
@@ -1024,7 +1062,7 @@ class Indexer(CustomOp):
         )  # [bs, 64 + 64]
 
         k_pe = k_pe.view(-1, 1, 1, self.rope_head_dim)
-        k_pe = torch_npu.npu_interleave_rope(k_pe, cos, sin).view(
+        k_pe = torch_npu.npu_rotary_mul(k_pe, cos, sin).view(
             bs, 1, self.rope_head_dim
         )  # [bs, 1, d]
         k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
@@ -1093,9 +1131,16 @@ class Indexer(CustomOp):
 
         past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
 
-        x = x.view(-1, self.hidden_size)
-        # weights = self.weights_proj(x.float())[0]
-        weights = self.weights_proj(x)[0]
+        if _use_multi_stream:
+            torch.npu.current_stream().wait_event(q_rope_event)
+            torch.npu.current_stream().wait_event(weights_event)
+
+        if indexer_weights is None:
+            weights = self.weights_proj(x.view(-1, self.hidden_size))[0]
+        else:
+            weights = indexer_weights
+
+        block_table = forward_batch.attn_backend.forward_metadata.block_tables
         block_table = (
             block_table[: actual_seq_lengths_q.size()[0]] if is_prefill else block_table
         )
