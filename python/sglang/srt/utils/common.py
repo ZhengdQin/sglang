@@ -667,6 +667,15 @@ def set_cmo_stream(stream):
     cmo_stream = stream
 
 
+def get_indexer_stream(device="cuda"):
+    if is_npu():
+        device = "npu"
+    global get_indexer_stream
+    if indexer_stream is None:
+        indexer_stream = torch.get_device_module(device).Stream()
+    return indexer_stream
+
+
 def prepare_weight_cache(handle, cache, PREFETCH_MAX_SIZE=1000000000):
     """
     PREFETCH_MAX_SIZE: maximum size (bytes) for each prefetch operation.
