@@ -949,6 +949,7 @@ class Indexer(CustomOp):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
+        dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
 
         from sglang.srt.layers.dp_attention import (
