@@ -21,7 +21,9 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.layers.attention.npu_ops.mla_preprocess import is_mla_prolog_enabled
+from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+    is_mla_prolog_enabled,
+)
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
@@ -202,7 +204,6 @@ class ReplicatedLinear(LinearBase):
         super().__init__(
             input_size,
             output_size,
-            bias,
             skip_bias_add,
             params_dtype,
             quant_config,
