@@ -62,8 +62,8 @@ def npu_fused_experts(
         }
     else:
         scale_args13 = {
-            "antiquant_scale": [w13_scale],
-            "antiquant_offset": [w13_offset],
+            "antiquant_scale": [w13_scale] if w13_scale is not None else None,
+            "antiquant_offset": [w13_offset] if w13_offset is not None else None,
         }
 
     hidden_states = torch.ops.npu.npu_grouped_matmul(
@@ -86,7 +86,10 @@ def npu_fused_experts(
             "per_token_scale": [pertoken_scale],
         }
     else:
-        scale_args2 = {"antiquant_scale": [w2_scale], "antiquant_offset": [w2_offset]}
+        scale_args2 = {
+            "antiquant_scale": [w2_scale] if w2_scale is not None else None,
+            "antiquant_offset": [w2_offset] if w2_offset is not None else None,
+        }
     # gmm2: down_proj
     hidden_states = torch.ops.npu.npu_grouped_matmul(
         x=[hidden_states],

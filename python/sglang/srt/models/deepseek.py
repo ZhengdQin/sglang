@@ -48,7 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 
 class DeepseekMLP(nn.Module):
@@ -176,13 +176,30 @@ class DeepseekMoE(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = fused_moe.fused_moe(
-            hidden_states,
-            w1=self.w1,
-            w2=self.w2,
-            topk_output=topk_output,
-            moe_runner_config=MoeRunnerConfig(inplace=True),
-        )
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+                npu_fused_experts,
+            )
+
+            final_hidden_states = npu_fused_experts(
+                hidden_states=hidden_states,
+                w13=self.w1.transpose(1, 2),
+                w13_scale=None,
+                w2=self.w2.transpose(1, 2),
+                w2_scale=None,
+                topk_weights=topk_output.topk_weights,
+                topk_ids=topk_output.topk_ids,
+                top_k=self.top_k,
+                use_wna16=True,
+            )
+        else:
+            final_hidden_states = fused_moe.fused_moe(
+                hidden_states,
+                w1=self.w1,
+                w2=self.w2,
+                topk_output=topk_output,
+                moe_runner_config=MoeRunnerConfig(inplace=True),
+            )
 
         if self.config.n_shared_experts is not None:
             final_hidden_states = final_hidden_states + shared_output

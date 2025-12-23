@@ -416,13 +416,23 @@ class ModelRunnerKVCacheMixin:
                     NPUMLATokenToKVPool,
                 )
 
+                if hasattr(self.model_config.hf_config, "language_config"):
+                    _config = self.model_config.hf_config.language_config
+                    print(
+                        f"=========>qzdqzd self.model_config is replaced with self.model_config.hf_config.language_config, and {is_nsa_model=}",
+                        flush=True,
+                    )
+                    is_nsa_model = is_nsa_model or is_deepseek_nsa(_config)
+                else:
+                    _config = self.model_config
+
                 self.token_to_kv_pool = NPUMLATokenToKVPool(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
-                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    index_head_dim=self.model_config.index_head_dim,
+                    kv_lora_rank=_config.kv_lora_rank,
+                    qk_rope_head_dim=_config.qk_rope_head_dim,
+                    index_head_dim=_config.index_head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
                     enable_memory_saver=self.server_args.enable_memory_saver,

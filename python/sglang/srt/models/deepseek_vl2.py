@@ -1,3 +1,4 @@
+import logging
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -6,6 +7,7 @@ from einops import rearrange, repeat
 from torch import nn
 
 from sglang.srt.configs.deepseekvl2 import (
+    DeepseekV3Config,
     DeepseekVL2Config,
     DeepseekVL2MlpProjectorConfig,
 )
@@ -19,7 +21,10 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
-from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV32ForCausalLM
+from sglang.srt.utils import log_info_on_rank0
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekVL2MlpProjector(nn.Module):
@@ -191,7 +196,56 @@ class DeepseekVL2ForCausalLM(nn.Module):
         # ----------- language model ------------
         language_config = config.language_config
         if language_config.use_mla:
-            self.language_model = DeepseekV2ForCausalLM(language_config)
+            if isinstance(language_config, DeepseekV3Config):
+                model_class = DeepseekV32ForCausalLM
+                quant_config = language_config.quantization_config
+                quant_config_cls = None
+                if quant_config:
+                    from sglang.srt.layers.quantization import get_quantization_config
+
+                    quant_cls = get_quantization_config(
+                        quant_config.get("quant_method", None)
+                    )
+                    quant_config["packed_modules_mapping"] = {
+                        "visual": {
+                            "qkv_proj": ["qkv"],
+                            "gate_up_proj": ["gate_proj", "up_proj"],
+                        },
+                        "vision_model": {
+                            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                            "proj": ["out_proj"],
+                        },
+                        "model": {
+                            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+                            "gate_up_proj": ["gate_proj", "up_proj"],
+                            "fused_qkv_a_proj_with_mqa": [
+                                "q_a_proj",
+                                "kv_a_proj_with_mqa",
+                            ],
+                        },
+                    }
+                    quant_config_cls = quant_cls.from_config(quant_config)
+                    log_info_on_rank0(logger, f"{quant_config_cls.__dict__=}")
+
+                    from sglang.srt.model_loader.loader import DefaultModelLoader
+
+                    setattr(
+                        language_config,
+                        "model_path",
+                        "/data/models/DeepSeek-V3.2-Exp-W8A8C8",
+                    )
+                    setattr(language_config, "revision", None)
+                    secondary_source = DefaultModelLoader.Source.init_new(
+                        language_config, self
+                    )
+                    secondary_source.prefix = "dsv32."
+                    self.secondary_weights = [secondary_source]
+            else:
+                model_class = DeepseekV2ForCausalLM
+                quant_config_cls = None
+            self.language_model = model_class(
+                language_config, quant_config=quant_config_cls
+            )
         else:
             # deepseek-vl2-tiny forbids mla
             self.language_model = DeepseekForCausalLM(language_config)
@@ -246,9 +300,17 @@ class DeepseekVL2ForCausalLM(nn.Module):
         weights = list(weights)
         for name, loaded_weight in weights:
             if "language" in name:
-                name = name.replace("language.", "")
+                if not hasattr(self, "secondary_weights"):
+                    name = name.replace("language.", "")
+                    self.language_model.load_weights([(name, loaded_weight)])
+            elif "dsv32" in name:
+                name = name.replace("dsv32.", "")
+                self.language_model.post_load_weights(
+                    is_nextn=False, weight_names=[name]
+                )
+                continue
                 self.language_model.load_weights([(name, loaded_weight)])
-            else:
+            elif name in params_dict:
                 param = params_dict[name]
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)

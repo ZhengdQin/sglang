@@ -1006,7 +1006,21 @@ def embed_mm_inputs(
             continue
         # in-place update
         indices = torch.where(mask.squeeze(dim=-1))[0]
-        input_embeds[indices] = embedding.to(input_embeds.device, input_embeds.dtype)
+        embedding = embedding.to(input_embeds.device, input_embeds.dtype)
+        if embedding.shape[-1] < input_embeds.shape[-1]:
+            embedding = torch.cat(
+                [
+                    embedding,
+                    embedding.new_zeros(
+                        (
+                            *embedding.shape[:-1],
+                            input_embeds.shape[-1] - embedding.shape[-1],
+                        )
+                    ),
+                ],
+                dim=-1,
+            )
+        input_embeds[indices] = embedding
         if use_deepstack.get(modality, None):
             input_deepstack_embeds[indices] = deepstack_embeddings[i].to(
                 input_embeds.device, input_embeds.dtype
