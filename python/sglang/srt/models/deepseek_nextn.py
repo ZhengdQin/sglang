@@ -97,7 +97,7 @@ class DeepseekModelNextN(nn.Module):
 
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.alt_stream = torch.cuda.Stream() if _is_cuda or _is_npu else None
 
         layer_name = "decoder"
         if _is_npu and (
@@ -220,7 +220,6 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
         )
         self.logits_processor = LogitsProcessor(config)
-        self._executed_weight_requant_ue8m0 = False
 
     @torch.no_grad()
     def forward(
